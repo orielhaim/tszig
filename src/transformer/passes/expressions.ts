@@ -1,5 +1,6 @@
 import * as ts from "typescript";
 import type { TransformContext } from "../index";
+import { calleeBodyAllocates } from "../../analyzer/allocation";
 import {
   resolveType,
   resolveTypeFromNode,
@@ -308,7 +309,12 @@ export function transformExpression(
       transformExpression(e, ctx, elementType),
     );
 
-    return { kind: "arrayLiteral", elements, elementType };
+    const contextualType = ctx.checker.getContextualType(node);
+    const isTuple = !!(
+      contextualType && ctx.checker.isTupleType(contextualType)
+    );
+
+    return { kind: "arrayLiteral", elements, elementType, isTuple };
   }
 
   // Object literal
@@ -384,12 +390,10 @@ export function transformExpression(
     return transformExpression(node.expression, ctx, typeHint);
   }
 
-  // As expression (type assertion)
   if (ts.isAsExpression(node)) {
     return transformExpression(node.expression, ctx, typeHint);
   }
 
-  // Conditional (ternary) a ? b : c
   if (ts.isConditionalExpression(node)) {
     return {
       kind: "if",
@@ -403,9 +407,17 @@ export function transformExpression(
     };
   }
 
-  // New expression → init()
   if (ts.isNewExpression(node)) {
-    const callee = transformExpression(node.expression, ctx);
+    const instantiation = getNewExpressionInstantiation(node, ctx);
+    const classExpr = instantiation.classExpr;
+
+    const callee = instantiation.typeArgZig
+      ? {
+          kind: "instantiatedType" as const,
+          base: classExpr.getText(ctx.sourceFile),
+          typeArg: instantiation.typeArgZig,
+        }
+      : transformExpression(classExpr, ctx);
     const args = (node.arguments ?? []).map((a) => transformExpression(a, ctx));
     const resultType = resolveType(
       ctx.checker.getTypeAtLocation(node),
@@ -608,50 +620,24 @@ function analyzeCallee(
     return { needsAllocator: false, returnsError: false };
   }
 
-  const body = decl.body;
-  if (!body || !ts.isBlock(body)) {
-    return { needsAllocator: false, returnsError: false };
-  }
-
-  let needsAllocator = false;
-  let returnsError = false;
-
-  function visit(n: ts.Node) {
-    if (needsAllocator && returnsError) return;
-
-    if (ts.isArrayLiteralExpression(n)) {
-      needsAllocator = true;
-    }
-    if (ts.isTemplateExpression(n)) {
-      needsAllocator = true;
-    }
-    if (
-      ts.isBinaryExpression(n) &&
-      n.operatorToken.kind === ts.SyntaxKind.PlusToken
-    ) {
-      const leftType = ctx.checker.getTypeAtLocation(n.left);
-      if (
-        leftType.flags & ts.TypeFlags.String ||
-        leftType.flags & ts.TypeFlags.StringLiteral
-      ) {
-        needsAllocator = true;
-      }
-    }
-
-    if (ts.isThrowStatement(n)) {
-      returnsError = true;
-    }
-
-    ts.forEachChild(n, visit);
-  }
-
-  ts.forEachChild(body, visit);
-
-  if (needsAllocator) {
-    returnsError = true;
-  }
+  const needsAllocator = calleeBodyAllocates(decl, ctx);
+  const returnsError =
+    needsAllocator || (decl.body ? bodyHasThrow(decl.body) : false);
 
   return { needsAllocator, returnsError };
+}
+
+function bodyHasThrow(body: ts.Block): boolean {
+  let has = false;
+  function visit(n: ts.Node) {
+    if (ts.isThrowStatement(n)) {
+      has = true;
+      return;
+    }
+    ts.forEachChild(n, visit);
+  }
+  ts.forEachChild(body, visit);
+  return has;
 }
 
 function resolveObjectLiteralTypeName(
@@ -700,6 +686,48 @@ function resolveObjectLiteralTypeName(
   }
 
   return undefined;
+}
+
+export function getNewExpressionInstantiation(
+  node: ts.NewExpression,
+  ctx: TransformContext,
+): { classExpr: ts.Expression; typeArgZig?: string } {
+  let classExpr = node.expression;
+  const typeArgNodes =
+    node.typeArguments ??
+    (ts.isExpressionWithTypeArguments(classExpr)
+      ? classExpr.typeArguments
+      : undefined);
+
+  let typeArgZig: string | undefined;
+  if (typeArgNodes && typeArgNodes.length > 0) {
+    const typeArgIr = resolveTypeFromNode(
+      typeArgNodes[0],
+      ctx.checker,
+      ctx.sourceFile,
+    );
+    typeArgZig = typeArgIrToZig(typeArgIr);
+  }
+
+  if (ts.isExpressionWithTypeArguments(classExpr)) {
+    classExpr = classExpr.expression;
+  }
+
+  return { classExpr, typeArgZig };
+}
+
+function typeArgIrToZig(type: IRType): string {
+  switch (type.kind) {
+    case "primitive":
+      return type.name;
+    case "string":
+      return "[]const u8";
+    case "struct":
+    case "enum":
+      return type.name;
+    default:
+      return "anytype";
+  }
 }
 
 function isInternalTypeName(name: string): boolean {

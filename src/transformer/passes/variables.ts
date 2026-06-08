@@ -5,7 +5,10 @@ import {
   resolveTypeFromNode,
   needsAllocator,
 } from "../../analyzer/type-resolver";
-import { transformExpression } from "./expressions";
+import {
+  getNewExpressionInstantiation,
+  transformExpression,
+} from "./expressions";
 import type { IRVariable, IRType } from "../../types";
 
 export function transformVariable(
@@ -18,6 +21,18 @@ export function transformVariable(
   let type: IRType;
   if (decl.type) {
     type = resolveTypeFromNode(decl.type, ctx.checker, ctx.sourceFile);
+  } else if (decl.initializer && ts.isNewExpression(decl.initializer)) {
+    const instantiation = getNewExpressionInstantiation(decl.initializer, ctx);
+    if (instantiation.typeArgZig) {
+      type = {
+        kind: "instantiatedStruct",
+        base: instantiation.classExpr.getText(ctx.sourceFile),
+        typeArg: instantiation.typeArgZig,
+      };
+    } else {
+      const tsType = ctx.checker.getTypeAtLocation(decl);
+      type = resolveType(tsType, ctx.checker);
+    }
   } else {
     const tsType = ctx.checker.getTypeAtLocation(decl);
     type = resolveType(tsType, ctx.checker);

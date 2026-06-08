@@ -90,6 +90,10 @@ export function typeToZig(type: IRType, gm: GenericMap | null): string {
       return `?${typeToZig(type.inner, gm)}`;
     case "array":
       return `std.ArrayList(${typeToZig(type.elementType, gm)})`;
+    case "tuple":
+      return `struct { ${type.elements.map((e) => typeToZig(e, gm)).join(", ")} }`;
+    case "instantiatedStruct":
+      return `${type.base}(${type.typeArg})`;
     case "struct":
       return type.name;
     case "errorUnion":
@@ -128,6 +132,8 @@ export function containsGeneric(type: IRType): boolean {
       return true;
     case "array":
       return containsGeneric(type.elementType);
+    case "tuple":
+      return type.elements.some(containsGeneric);
     case "optional":
       return containsGeneric(type.inner);
     case "errorUnion":

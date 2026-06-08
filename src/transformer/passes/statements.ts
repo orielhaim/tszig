@@ -3,7 +3,7 @@ import type { TransformContext } from "../index";
 import { transformExpression } from "./expressions";
 import { transformVariable } from "./variables";
 import { resolveType } from "../../analyzer/type-resolver";
-import type { IRNode } from "../../types";
+import type { IRIfStatement, IRNode } from "../../types";
 
 export function transformStatement(
   node: ts.Node,
@@ -45,13 +45,22 @@ export function transformStatement(
 
   // If
   if (ts.isIfStatement(node)) {
+    const optionalCapture = detectOptionalNullCheck(node.expression, ctx);
     const condition = transformExpression(node.expression, ctx);
-    const thenBody = transformStatementToBody(node.thenStatement, ctx);
+    let thenBody = transformStatementToBody(node.thenStatement, ctx);
     const elseBody = node.elseStatement
       ? transformStatementToBody(node.elseStatement, ctx)
       : undefined;
 
-    return { kind: "if", condition, thenBody, elseBody };
+    if (optionalCapture) {
+      thenBody = rewriteIdentifierInBody(
+        thenBody,
+        optionalCapture.variable,
+        optionalCapture.captureName,
+      );
+    }
+
+    return { kind: "if", condition, thenBody, elseBody, optionalCapture };
   }
 
   // While
@@ -323,4 +332,81 @@ function resolveIterationItemType(
     }
   }
   return null;
+}
+
+function detectOptionalNullCheck(
+  expr: ts.Expression,
+  ctx: TransformContext,
+): IRIfStatement["optionalCapture"] {
+  if (!ts.isBinaryExpression(expr)) return undefined;
+
+  const op = expr.operatorToken.kind;
+  const isNotNull =
+    op === ts.SyntaxKind.ExclamationEqualsToken ||
+    op === ts.SyntaxKind.ExclamationEqualsEqualsToken;
+  if (!isNotNull) return undefined;
+
+  let valueSide: ts.Expression | undefined;
+  if (isNullishLiteral(expr.left)) {
+    valueSide = expr.right;
+  } else if (isNullishLiteral(expr.right)) {
+    valueSide = expr.left;
+  }
+  if (!valueSide || !ts.isIdentifier(valueSide)) return undefined;
+
+  const varType = resolveType(
+    ctx.checker.getTypeAtLocation(valueSide),
+    ctx.checker,
+  );
+  if (varType.kind !== "optional") return undefined;
+
+  const variable = valueSide.text;
+  return {
+    variable,
+    captureName: `${variable}_unwrapped`,
+    polarity: "notNull",
+  };
+}
+
+function rewriteIdentifierInBody(
+  nodes: IRNode[],
+  from: string,
+  to: string,
+): IRNode[] {
+  return nodes.map((node) => rewriteIdentifierInNode(node, from, to));
+}
+
+function rewriteIdentifierInNode(
+  node: IRNode,
+  from: string,
+  to: string,
+): IRNode {
+  if (!node || typeof node !== "object") return node;
+
+  if (node.kind === "identifier" && (node as any).name === from) {
+    return { ...(node as any), name: to };
+  }
+
+  const result = { ...node } as any;
+  for (const key of Object.keys(node)) {
+    const val = (node as any)[key];
+    if (Array.isArray(val)) {
+      result[key] = val.map((item: IRNode) =>
+        item && typeof item === "object" && "kind" in item
+          ? rewriteIdentifierInNode(item, from, to)
+          : item,
+      );
+    } else if (val && typeof val === "object" && "kind" in val) {
+      result[key] = rewriteIdentifierInNode(val, from, to);
+    }
+  }
+  return result;
+}
+
+function isNullishLiteral(node: ts.Node): boolean {
+  return (
+    node.kind === ts.SyntaxKind.NullKeyword ||
+    node.kind === ts.SyntaxKind.UndefinedKeyword ||
+    (ts.isIdentifier(node) && node.text === "undefined")
+  );
 }

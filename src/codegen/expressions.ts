@@ -17,6 +17,9 @@ export function generateExpr(node: IRNode, diagnostics: Diagnostic[]): string {
     case "identifier":
       return sanitizeName((node as any).name);
 
+    case "instantiatedType":
+      return `${sanitizeName((node as any).base)}(${(node as any).typeArg})`;
+
     case "binary": {
       const left = generateExpr((node as any).left, diagnostics);
       const right = generateExpr((node as any).right, diagnostics);
@@ -96,8 +99,15 @@ export function generateExpr(node: IRNode, diagnostics: Diagnostic[]): string {
     case "index":
       return `${generateExpr((node as any).object, diagnostics)}[${generateExpr((node as any).index, diagnostics)}]`;
 
-    case "arrayLiteral":
+    case "arrayLiteral": {
+      if ((node as any).isTuple) {
+        const elems = (node as any).elements.map((e: IRNode) =>
+          generateExpr(e, diagnostics),
+        );
+        return `.{ ${elems.join(", ")} }`;
+      }
       return `// inline array literal`;
+    }
 
     case "objectLiteral": {
       const typeName = (node as any).typeName as string | undefined;

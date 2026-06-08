@@ -1,11 +1,13 @@
 import * as ts from "typescript";
 import type { TransformContext } from "../index";
+import { blockAllocates, bodyMutatesThis } from "../../analyzer/allocation";
 import {
   resolveType,
   resolveTypeFromNode,
   needsAllocator,
 } from "../../analyzer/type-resolver";
 import { transformExpression } from "./expressions";
+import { replaceGenericTypes } from "./functions";
 import { transformStatement } from "./statements";
 import type {
   IRStruct,
@@ -21,6 +23,12 @@ export function transformClass(
   ctx: TransformContext,
 ): IRStruct | null {
   const name = node.name?.text ?? "AnonymousClass";
+  const typeParamNames = new Set<string>();
+  if (node.typeParameters) {
+    for (const tp of node.typeParameters) {
+      typeParamNames.add(tp.name.text);
+    }
+  }
   const fields: IRField[] = [];
   const methods: IRFunction[] = [];
   let hasExplicitConstructor = false;
@@ -68,6 +76,10 @@ export function transformClass(
         } else {
           defaultValue = transformExpression(member.initializer, ctx);
         }
+      }
+
+      if (typeParamNames.size > 0) {
+        fieldType = replaceGenericTypes(fieldType, typeParamNames);
       }
 
       fields.push({
@@ -158,9 +170,13 @@ export function transformClass(
       const params: IRParam[] = [];
       for (const param of member.parameters) {
         const paramName = param.name.getText(ctx.sourceFile);
-        const paramType = param.type
+        let paramType = param.type
           ? resolveTypeFromNode(param.type, ctx.checker, ctx.sourceFile)
           : resolveType(ctx.checker.getTypeAtLocation(param), ctx.checker);
+
+        if (typeParamNames.size > 0) {
+          paramType = replaceGenericTypes(paramType, typeParamNames);
+        }
 
         params.push({
           name: paramName,
@@ -188,7 +204,11 @@ export function transformClass(
         }
       }
 
-      const fnNeedsAllocator = methodBodyAllocates(member.body, ctx);
+      if (typeParamNames.size > 0) {
+        returnType = replaceGenericTypes(returnType, typeParamNames);
+      }
+
+      const fnNeedsAllocator = blockAllocates(member.body, ctx);
 
       const body: IRNode[] = [];
       if (member.body) {
@@ -202,7 +222,7 @@ export function transformClass(
         (m) => m.kind === ts.SyntaxKind.StaticKeyword,
       );
 
-      const isReadOnly = !isStatic && !methodMutatesSelf(member.body, ctx);
+      const isReadOnly = !isStatic && !bodyMutatesThis(member.body);
 
       if (fnNeedsAllocator) {
         returnType = { kind: "errorUnion", okType: returnType };
@@ -246,6 +266,8 @@ export function transformClass(
     methods,
     isPublic: ctx.exports.has(name),
     hasInit: true,
+    typeParameters:
+      typeParamNames.size > 0 ? Array.from(typeParamNames) : undefined,
   };
 }
 
@@ -266,95 +288,4 @@ function extractThisAssignment(
   const value = transformExpression(expr.right, ctx);
 
   return { field: fieldName, value };
-}
-
-function methodBodyAllocates(
-  body: ts.Block | undefined,
-  ctx: TransformContext,
-): boolean {
-  if (!body) return false;
-  let allocates = false;
-
-  function visit(node: ts.Node) {
-    if (allocates) return;
-
-    if (ts.isArrayLiteralExpression(node)) {
-      allocates = true;
-      return;
-    }
-
-    if (ts.isTemplateExpression(node)) {
-      allocates = true;
-      return;
-    }
-
-    if (
-      ts.isBinaryExpression(node) &&
-      node.operatorToken.kind === ts.SyntaxKind.PlusToken
-    ) {
-      const leftType = ctx.checker.getTypeAtLocation(node.left);
-      if (
-        leftType.flags & ts.TypeFlags.String ||
-        leftType.flags & ts.TypeFlags.StringLiteral
-      ) {
-        allocates = true;
-        return;
-      }
-    }
-
-    ts.forEachChild(node, visit);
-  }
-
-  ts.forEachChild(body, visit);
-  return allocates;
-}
-
-function methodMutatesSelf(
-  body: ts.Block | undefined,
-  ctx: TransformContext,
-): boolean {
-  if (!body) return false;
-  let mutates = false;
-
-  function visit(node: ts.Node): void {
-    if (mutates) return;
-
-    if (
-      ts.isBinaryExpression(node) &&
-      isAssignmentOperatorKind(node.operatorToken.kind) &&
-      ts.isPropertyAccessExpression(node.left) &&
-      node.left.expression.kind === ts.SyntaxKind.ThisKeyword
-    ) {
-      mutates = true;
-      return;
-    }
-
-    if (
-      ts.isCallExpression(node) &&
-      ts.isPropertyAccessExpression(node.expression) &&
-      node.expression.expression.kind === ts.SyntaxKind.ThisKeyword
-    ) {
-      mutates = true;
-      return;
-    }
-
-    ts.forEachChild(node, visit);
-  }
-
-  ts.forEachChild(body, visit);
-  return mutates;
-}
-
-function isAssignmentOperatorKind(kind: ts.SyntaxKind): boolean {
-  return (
-    kind === ts.SyntaxKind.EqualsToken ||
-    kind === ts.SyntaxKind.PlusEqualsToken ||
-    kind === ts.SyntaxKind.MinusEqualsToken ||
-    kind === ts.SyntaxKind.AsteriskEqualsToken ||
-    kind === ts.SyntaxKind.SlashEqualsToken ||
-    kind === ts.SyntaxKind.PercentEqualsToken ||
-    kind === ts.SyntaxKind.AmpersandEqualsToken ||
-    kind === ts.SyntaxKind.BarEqualsToken ||
-    kind === ts.SyntaxKind.CaretEqualsToken
-  );
 }

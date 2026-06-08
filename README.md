@@ -1,7 +1,5 @@
 # TSZIG
 
-Convert TypeScript into Zig.
-
 TSZIG is an experimental compiler project that aims to transform TypeScript code into readable Zig code. The goal is to explore what a TypeScript-to-Zig workflow could look like while keeping the generated output simple and understandable.
 
 ## Why?

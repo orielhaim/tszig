@@ -1,4 +1,4 @@
-import type { IRModule, Diagnostic } from "../types";
+import type { IRFunction, IRModule, Diagnostic } from "../types";
 import { ZigWriter } from "./writer";
 import { generateNode } from "./statements";
 import { resetTempCounter, typeToZig } from "./utils";
@@ -72,25 +72,41 @@ function generateExecutableEntry(
   w: ZigWriter,
   diagnostics: Diagnostic[],
 ): void {
+  const mainNeedsAllocator = moduleMainNeedsAllocator(module);
+
   w.writeLine("pub fn main() !void {");
   w.indent();
-  w.writeLine(
-    "var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);",
-  );
-  w.writeLine("defer arena.deinit();");
-  w.writeLine("const allocator = arena.allocator();");
+
+  if (mainNeedsAllocator) {
+    w.writeLine(
+      "var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);",
+    );
+    w.writeLine("defer arena.deinit();");
+    w.writeLine("const allocator = arena.allocator();");
+    w.writeLine("");
+  }
 
   if (module.scriptBody.length > 0) {
-    w.writeLine("");
     for (const node of module.scriptBody) {
-      generateEntryNode(node, w, diagnostics);
+      generateEntryNode(node, w, diagnostics, mainNeedsAllocator);
     }
-  } else {
+  } else if (mainNeedsAllocator) {
     w.writeLine("try tszig_main(allocator);");
+  } else {
+    w.writeLine("tszig_main();");
   }
 
   w.dedent();
   w.writeLine("}");
+}
+
+function moduleMainNeedsAllocator(module: IRModule): boolean {
+  for (const node of module.body) {
+    if (node.kind === "function" && (node as IRFunction).isMain) {
+      return (node as IRFunction).needsAllocator;
+    }
+  }
+  return false;
 }
 
 function generateScriptEntry(
@@ -125,14 +141,19 @@ function generateEntryNode(
   node: any,
   w: ZigWriter,
   diagnostics: Diagnostic[],
+  mainNeedsAllocator: boolean,
 ): void {
   if (isMainCall(node)) {
-    w.writeLine("try tszig_main(allocator);");
+    w.writeLine(
+      mainNeedsAllocator ? "try tszig_main(allocator);" : "tszig_main();",
+    );
     return;
   }
 
   if (node.kind === "expressionStatement" && isMainCall(node.expression)) {
-    w.writeLine("try tszig_main(allocator);");
+    w.writeLine(
+      mainNeedsAllocator ? "try tszig_main(allocator);" : "tszig_main();",
+    );
     return;
   }
 

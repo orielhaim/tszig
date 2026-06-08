@@ -58,6 +58,12 @@ export function resolveType(type: ts.Type, checker: ts.TypeChecker): IRType {
     return { kind: "unknown" };
   }
 
+  if (checker.isTupleType(type)) {
+    const elements =
+      type.typeArguments?.map((t) => resolveType(t, checker)) ?? [];
+    return { kind: "tuple", elements };
+  }
+
   if (checker.isArrayType(type)) {
     const typeArgs = (type as ts.TypeReference).typeArguments;
     if (typeArgs && typeArgs.length > 0) {
@@ -229,6 +235,15 @@ export function resolveTypeFromNode(
     }
 
     return { kind: "struct", name: typeName };
+  }
+
+  if (ts.isTupleTypeNode(node)) {
+    return {
+      kind: "tuple",
+      elements: node.elements.map((e) =>
+        resolveTypeFromNode(e, checker, sourceFile),
+      ),
+    };
   }
 
   if (ts.isArrayTypeNode(node)) {

@@ -1,10 +1,7 @@
 import * as ts from "typescript";
 import type { TransformContext } from "../index";
-import {
-  resolveType,
-  resolveTypeFromNode,
-  needsAllocator,
-} from "../../analyzer/type-resolver";
+import { blockAllocates } from "../../analyzer/allocation";
+import { resolveType, resolveTypeFromNode } from "../../analyzer/type-resolver";
 import { transformStatement } from "./statements";
 import { transformExpression } from "./expressions";
 import type { IRFunction, IRParam, IRType, IRNode } from "../../types";
@@ -87,7 +84,7 @@ export function transformFunction(
     }
   }
 
-  const fnNeedsAllocator = bodyAllocates(node.body, ctx);
+  const fnNeedsAllocator = blockAllocates(node.body, ctx, true);
   const isMain = name === "main";
   const isPublic = ctx.exports.has(name) || isMain;
 
@@ -199,6 +196,11 @@ export function replaceGenericTypes(
         kind: "array",
         elementType: replaceGenericTypes(type.elementType, typeParams),
       };
+    case "tuple":
+      return {
+        kind: "tuple",
+        elements: type.elements.map((e) => replaceGenericTypes(e, typeParams)),
+      };
     case "optional":
       return {
         kind: "optional",
@@ -231,47 +233,6 @@ export function replaceGenericTypes(
     default:
       return type;
   }
-}
-
-function bodyAllocates(
-  body: ts.Block | undefined,
-  ctx: TransformContext,
-): boolean {
-  if (!body) return false;
-  let needs = false;
-
-  function visit(node: ts.Node) {
-    if (needs) return;
-    if (ts.isArrayLiteralExpression(node)) {
-      needs = true;
-      return;
-    }
-    if (
-      ts.isBinaryExpression(node) &&
-      node.operatorToken.kind === ts.SyntaxKind.PlusToken
-    ) {
-      const leftType = ctx.checker.getTypeAtLocation(node.left);
-      if (
-        leftType.flags & ts.TypeFlags.String ||
-        leftType.flags & ts.TypeFlags.StringLiteral
-      ) {
-        needs = true;
-        return;
-      }
-    }
-    if (ts.isTemplateExpression(node)) {
-      needs = true;
-      return;
-    }
-    if (ts.isObjectLiteralExpression(node)) {
-      needs = true;
-      return;
-    }
-    ts.forEachChild(node, visit);
-  }
-
-  ts.forEachChild(body, visit);
-  return needs;
 }
 
 function bodyHasThrow(body: ts.Block | undefined): boolean {

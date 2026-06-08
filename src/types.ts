@@ -39,6 +39,7 @@ export type IRNode =
   | IRIndexExpr
   | IRLiteral
   | IRIdentifier
+  | IRInstantiatedType
   | IRArrayLiteral
   | IRObjectLiteral
   | IRTemplateLiteral
@@ -99,6 +100,7 @@ export interface IRStruct {
   methods: IRFunction[];
   isPublic: boolean;
   hasInit: boolean;
+  typeParameters?: string[];
 }
 
 export interface IRField {
@@ -128,6 +130,11 @@ export interface IRIfStatement {
   condition: IRNode;
   thenBody: IRNode[];
   elseBody?: IRNode[];
+  optionalCapture?: {
+    variable: string;
+    captureName: string;
+    polarity: "notNull";
+  };
 }
 
 export interface IRWhileLoop {
@@ -214,10 +221,17 @@ export interface IRIdentifier {
   type: IRType;
 }
 
+export interface IRInstantiatedType {
+  kind: "instantiatedType";
+  base: string;
+  typeArg: string;
+}
+
 export interface IRArrayLiteral {
   kind: "arrayLiteral";
   elements: IRNode[];
   elementType: IRType;
+  isTuple?: boolean;
 }
 
 export interface IRObjectLiteral {
@@ -299,6 +313,8 @@ export type IRType =
   | { kind: "string" }
   | { kind: "optional"; inner: IRType }
   | { kind: "array"; elementType: IRType }
+  | { kind: "tuple"; elements: IRType[] }
+  | { kind: "instantiatedStruct"; base: string; typeArg: string }
   | { kind: "struct"; name: string }
   | { kind: "errorUnion"; okType: IRType; errorSet?: string }
   | { kind: "pointer"; inner: IRType; isConst: boolean }

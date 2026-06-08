@@ -108,11 +108,12 @@ export function generateFunction(
   w: ZigWriter,
   diagnostics: Diagnostic[],
   depth: number,
+  parentGm: GenericMap | null = null,
 ): void {
   const pub = node.isPublic ? "pub " : "";
   const name = node.isMain ? "tszig_main" : node.name;
 
-  let gm: GenericMap | null = null;
+  let gm: GenericMap | null = parentGm;
   if (node.isGeneric) {
     gm = buildGenericMap(node);
   }
@@ -133,7 +134,7 @@ export function generateFunction(
 
   for (const p of node.params) {
     const paramType = p.type;
-    if (containsGenericOrUnknown(paramType)) {
+    if (node.isGeneric || (containsGenericOrUnknown(paramType) && !gm)) {
       params.push(`${sanitizeName(p.name)}: anytype`);
     } else {
       params.push(`${sanitizeName(p.name)}: ${typeToZig(p.type, gm)}`);
@@ -162,6 +163,8 @@ function containsGenericOrUnknown(type: IRType): boolean {
       return true;
     case "array":
       return containsGenericOrUnknown(type.elementType);
+    case "tuple":
+      return type.elements.some(containsGenericOrUnknown);
     case "optional":
       return containsGenericOrUnknown(type.inner);
     case "errorUnion":
@@ -181,17 +184,84 @@ function containsGenericOrUnknown(type: IRType): boolean {
 }
 
 function resolveReturnType(node: IRFunction, gm: GenericMap | null): string {
-  const rt = node.returnType;
+  const zigType = typeToZig(node.returnType, gm);
 
-  if (!node.isGeneric) {
-    return typeToZig(rt, gm);
+  if (node.isGeneric && isInvalidGenericReturnType(zigType)) {
+    const inferred = inferReturnTypeFromBody(node);
+    if (inferred) {
+      return inferred;
+    }
   }
 
-  if (gm) {
-    return typeToZig(rt, gm);
-  }
+  return zigType;
+}
 
-  return typeToZig(rt, null);
+function isInvalidGenericReturnType(zigType: string): boolean {
+  return (
+    zigType === "anytype" ||
+    zigType === "!anytype" ||
+    /\banytype\b/.test(zigType)
+  );
+}
+
+function inferReturnTypeFromBody(node: IRFunction): string | null {
+  const value = findReturnValue(node.body);
+  if (!value) return null;
+
+  const paramNames = new Set(node.params.map((p) => p.name));
+  const expr = irNodeToTypeofExpr(value, paramNames);
+  if (!expr) return null;
+
+  if (node.returnType.kind === "errorUnion") {
+    return `!@TypeOf(${expr})`;
+  }
+  return `@TypeOf(${expr})`;
+}
+
+function findReturnValue(nodes: IRNode[]): IRNode | null {
+  for (const node of nodes) {
+    if (node.kind === "return" && (node as any).value) {
+      return (node as any).value;
+    }
+    if (node.kind === "block") {
+      const nested = findReturnValue((node as any).body);
+      if (nested) return nested;
+    }
+  }
+  return null;
+}
+
+function irNodeToTypeofExpr(
+  node: IRNode,
+  paramNames: Set<string>,
+): string | null {
+  switch (node.kind) {
+    case "arrayLiteral": {
+      if (!(node as any).isTuple) return null;
+      const elems = (node as any).elements.map((e: IRNode) => {
+        if (e.kind === "identifier") {
+          const name = (e as any).name as string;
+          if (!paramNames.has(name)) return null;
+          return sanitizeName(name);
+        }
+        return null;
+      });
+      if (elems.some((e: string | null) => e === null)) return null;
+      return `.{ ${elems.join(", ")} }`;
+    }
+    case "identifier": {
+      const name = (node as any).name as string;
+      if (!paramNames.has(name)) return null;
+      return sanitizeName(name);
+    }
+    case "member": {
+      const objectExpr = irNodeToTypeofExpr((node as any).object, paramNames);
+      if (!objectExpr) return null;
+      return `${objectExpr}.${sanitizeName((node as any).property)}`;
+    }
+    default:
+      return null;
+  }
 }
 
 function buildGenericMap(fn: IRFunction): GenericMap {
@@ -306,15 +376,29 @@ function generateStruct(
   depth: number,
 ): void {
   const pub = node.isPublic ? "pub " : "";
+  const isGenericClass = node.typeParameters && node.typeParameters.length > 0;
+  const classGm: GenericMap | null = isGenericClass
+    ? new Map(node.typeParameters!.map((tp) => [tp, tp]))
+    : null;
 
-  w.writeLine(`${pub}const ${node.name} = struct {`);
-  w.indent();
+  if (isGenericClass) {
+    const typeParams = node
+      .typeParameters!.map((tp) => `comptime ${sanitizeName(tp)}: type`)
+      .join(", ");
+    w.writeLine(`${pub}fn ${node.name}(${typeParams}) type {`);
+    w.indent();
+    w.writeLine("return struct {");
+    w.indent();
+  } else {
+    w.writeLine(`${pub}const ${node.name} = struct {`);
+    w.indent();
+  }
 
   w.writeLine("const Self = @This();");
   w.writeLine("");
 
   for (const field of node.fields) {
-    const fieldType = typeToZig(field.type, null);
+    const fieldType = typeToZig(field.type, classGm);
     if (field.defaultValue) {
       if ((field.defaultValue as any).kind === "emptyArrayInit") {
         w.writeLine(`${sanitizeName(field.name)}: ${fieldType} = .empty,`);
@@ -337,18 +421,22 @@ function generateStruct(
   if (node.hasInit) {
     const initMethod = node.methods.find((m) => m.name === "init");
     if (initMethod) {
-      generateInitMethod(node, initMethod, w, diagnostics);
+      generateInitMethod(node, initMethod, w, diagnostics, classGm);
     }
   }
 
   for (const method of node.methods) {
     if (method.name === "init") continue;
     w.writeLine("");
-    generateFunction(method, w, diagnostics, depth + 1);
+    generateFunction(method, w, diagnostics, depth + 1, classGm);
   }
 
   w.dedent();
   w.writeLine("};");
+  if (isGenericClass) {
+    w.dedent();
+    w.writeLine("}");
+  }
 }
 
 function generateInitMethod(
@@ -356,10 +444,11 @@ function generateInitMethod(
   initMethod: IRFunction,
   w: ZigWriter,
   diagnostics: Diagnostic[],
+  gm: GenericMap | null = null,
 ): void {
   const params: string[] = [];
   for (const p of initMethod.params) {
-    params.push(`${sanitizeName(p.name)}: ${typeToZig(p.type, null)}`);
+    params.push(`${sanitizeName(p.name)}: ${typeToZig(p.type, gm)}`);
   }
 
   w.writeLine(`pub fn init(${params.join(", ")}) Self {`);
@@ -436,6 +525,10 @@ function generateVariable(
 
     if (node.type.kind === "function") {
       w.writeLine(`${keyword} ${sanitizeName(node.name)} = ${valueStr};`);
+    } else if (node.type.kind === "instantiatedStruct") {
+      w.writeLine(
+        `${keyword} ${sanitizeName(node.name)}: ${typeToZig(node.type, gm)} = ${valueStr};`,
+      );
     } else if (node.type.kind !== "unknown" && !containsGeneric(node.type)) {
       valueStr = coerce(valueStr, valueType, node.type);
       const typeAnnotation = `: ${typeToZig(node.type, gm)}`;
@@ -509,8 +602,14 @@ function generateIf(
   depth: number,
   gm: GenericMap | null,
 ): void {
-  const cond = generateExpr(node.condition, diagnostics);
-  w.writeLine(`if (${cond}) {`);
+  if (node.optionalCapture?.polarity === "notNull") {
+    const varName = sanitizeName(node.optionalCapture.variable);
+    const captureName = sanitizeName(node.optionalCapture.captureName);
+    w.writeLine(`if (${varName}) |${captureName}| {`);
+  } else {
+    const cond = generateExpr(node.condition, diagnostics);
+    w.writeLine(`if (${cond}) {`);
+  }
   w.indent();
   for (const child of node.thenBody) {
     if (gm) {

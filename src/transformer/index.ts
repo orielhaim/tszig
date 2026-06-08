@@ -1,5 +1,7 @@
 import * as ts from "typescript";
 import type { AnalysisResult } from "../analyzer";
+import { ClassRegistry } from "./class-registry";
+import { blockAllocates } from "../analyzer/allocation";
 import type {
   Diagnostic,
   IRModule,
@@ -26,6 +28,15 @@ export function transformToIR(
 ): IRModule {
   _hoistCounter = 0;
 
+  const classRegistry = new ClassRegistry();
+  classRegistry.build(analysis.sourceFile);
+
+  classRegistry.computeMethodEffects(
+    (decl) =>
+      blockAllocates(decl.body, { checker }, /* includeCalleeCalls */ true),
+    (decl) => bodyHasThrowTS(decl.body),
+  );
+
   const ctx: TransformContext = {
     checker,
     sourceFile: analysis.sourceFile,
@@ -35,6 +46,7 @@ export function transformToIR(
     hoistedFunctions: [],
     anonStructs: [],
     anonStructCache: new Map(),
+    classRegistry,
   };
 
   const body: IRNode[] = [];
@@ -235,6 +247,20 @@ function collectOrderedScriptNodes(
   });
 }
 
+function bodyHasThrowTS(body: ts.Block | undefined): boolean {
+  if (!body) return false;
+  let has = false;
+  function visit(n: ts.Node) {
+    if (ts.isThrowStatement(n)) {
+      has = true;
+      return;
+    }
+    ts.forEachChild(n, visit);
+  }
+  ts.forEachChild(body, visit);
+  return has;
+}
+
 export interface TransformContext {
   checker: ts.TypeChecker;
   sourceFile: ts.SourceFile;
@@ -244,4 +270,6 @@ export interface TransformContext {
   hoistedFunctions: IRFunction[];
   anonStructs: IRStruct[];
   anonStructCache: Map<string, string>;
+  classRegistry: ClassRegistry;
+  currentClass?: string;
 }

@@ -1,13 +1,14 @@
 import type { IRFunction, IRModule, Diagnostic } from "../types";
 import { ZigWriter } from "./writer";
 import { generateNode } from "./statements";
-import { resetTempCounter, typeToZig } from "./utils";
+import { resetTempCounter, initStructHierarchy } from "./utils";
 
 export function generateZig(
   module: IRModule,
   diagnostics: Diagnostic[],
 ): string {
   resetTempCounter();
+  initStructHierarchy(module);
   const w = new ZigWriter();
 
   w.writeLine('const std = @import("std");');

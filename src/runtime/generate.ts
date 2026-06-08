@@ -123,5 +123,10 @@ export function generateRuntime(): string {
       }
       @compileError("ArrayListChild expects a std.ArrayList type, found '" ++ @typeName(T) ++ "'");
   }
+
+  pub fn __vtable_unreachable(self: *anyopaque) void {
+      _ = self;
+      @panic("called abstract method via vtable");
+  }
   `;
 }

@@ -16,9 +16,7 @@ export interface CompileResult {
   diagnostics: Diagnostic[];
 }
 
-// ============================================================
 // IR Node Types — Intermediate Representation between TS and Zig
-// ============================================================
 
 export type IRNode =
   | IRModule
@@ -51,18 +49,19 @@ export type IRNode =
   | IROptionalChain
   | IRNullishCoalesce
   | IRTypeAlias
-  | IRArrowFunction;
+  | IRArrowFunction
+  | IRSuperCall;
 
 export interface IRModule {
   kind: "module";
   fileName: string;
   imports: IRImport[];
-  body: IRNode[]; // declarations: structs, enums, functions, module-level consts
+  body: IRNode[];
   errors: string[];
   hasMain: boolean;
   moduleKind: "library" | "executable" | "script";
-  scriptBody: IRNode[]; // imperative statements → go inside generated main()
-  hoistedFunctions: IRFunction[]; // arrow functions extracted to module level
+  scriptBody: IRNode[];
+  hoistedFunctions: IRFunction[];
 }
 
 export interface IRImport {
@@ -84,6 +83,9 @@ export interface IRFunction {
   needsAllocator: boolean;
   isMain: boolean;
   isGeneric?: boolean;
+  isVirtual?: boolean;
+  isAbstract?: boolean;
+  ownerClass?: string;
 }
 
 export interface IRParam {
@@ -101,6 +103,24 @@ export interface IRStruct {
   isPublic: boolean;
   hasInit: boolean;
   typeParameters?: string[];
+  baseClass?: string;
+  isAbstract?: boolean;
+  virtualMethods?: string[];
+  ownMethodNames?: string[];
+  inheritedFields?: IRField[];
+  baseInstantiatedType?: string;
+  baseTypeSubst?: Record<string, string>;
+}
+
+export interface IRSuperCall {
+  kind: "superCall";
+  method: string;
+  args: IRNode[];
+  parentClass: string;
+  resultType?: IRType;
+  hierAllocates?: boolean;
+  hierThrows?: boolean;
+  isReadOnly?: boolean;
 }
 
 export interface IRField {
@@ -191,6 +211,7 @@ export interface IRCallExpr {
   callee: IRNode;
   args: IRNode[];
   resultType: IRType;
+  paramTypes?: IRType[];
   calleeNeedsAllocator?: boolean;
   calleeReturnsError?: boolean;
 }
@@ -302,7 +323,7 @@ export interface IRArrowFunction {
   returnType: IRType;
   body: IRNode[];
   captures: string[];
-  hoistedName?: string; // filled in after hoisting
+  hoistedName?: string;
 }
 
 export type IRType =

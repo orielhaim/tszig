@@ -1,6 +1,9 @@
 import * as ts from "typescript";
 import type { TransformContext } from "../index";
-import { calleeBodyAllocates } from "../../analyzer/allocation";
+import {
+  bodyMutatesThis,
+  calleeBodyAllocates,
+} from "../../analyzer/allocation";
 import {
   resolveType,
   resolveTypeFromNode,
@@ -87,6 +90,53 @@ export function transformExpression(
   if (ts.isIdentifier(node)) {
     const type = resolveType(ctx.checker.getTypeAtLocation(node), ctx.checker);
     return { kind: "identifier", name: node.text, type };
+  }
+
+  if (
+    ts.isCallExpression(node) &&
+    (node.expression.kind === ts.SyntaxKind.SuperKeyword ||
+      (ts.isPropertyAccessExpression(node.expression) &&
+        node.expression.expression.kind === ts.SyntaxKind.SuperKeyword))
+  ) {
+    const args = node.arguments.map((a) => transformExpression(a, ctx));
+    const currentClass = ctx.currentClass;
+    const info = currentClass ? ctx.classRegistry.get(currentClass) : undefined;
+    const parentClass = info?.baseClass ?? "UnknownBase";
+
+    let method = "constructor";
+    if (
+      ts.isPropertyAccessExpression(node.expression) &&
+      node.expression.expression.kind === ts.SyntaxKind.SuperKeyword
+    ) {
+      method = node.expression.name.text;
+    }
+
+    const resultType = resolveType(
+      ctx.checker.getTypeAtLocation(node),
+      ctx.checker,
+    );
+
+    const eff = currentClass
+      ? ctx.classRegistry.methodEffects(
+          parentClass,
+          method === "constructor" ? "init" : method,
+        )
+      : { allocates: false, throws: false };
+
+    const isReadOnly =
+      method !== "constructor" &&
+      isAncestorMethodReadOnly(ctx, parentClass, method);
+
+    return {
+      kind: "superCall",
+      method,
+      args,
+      parentClass,
+      resultType,
+      hierAllocates: eff.allocates,
+      hierThrows: eff.throws,
+      isReadOnly,
+    };
   }
 
   if (ts.isTemplateExpression(node)) {
@@ -217,11 +267,21 @@ export function transformExpression(
 
     const calleeAnalysis = analyzeCallee(node, ctx);
 
+    const paramTypes: IRType[] = [];
+    if (sig) {
+      for (const param of sig.parameters) {
+        paramTypes.push(
+          resolveType(ctx.checker.getTypeOfSymbol(param), ctx.checker),
+        );
+      }
+    }
+
     return {
       kind: "call",
       callee,
       args,
       resultType,
+      paramTypes: paramTypes.length > 0 ? paramTypes : undefined,
       calleeNeedsAllocator: calleeAnalysis.needsAllocator,
       calleeReturnsError: calleeAnalysis.returnsError,
     };
@@ -608,10 +668,8 @@ function analyzeCallee(
 ): { needsAllocator: boolean; returnsError: boolean } {
   const sig = ctx.checker.getResolvedSignature(node);
   if (!sig) return { needsAllocator: false, returnsError: false };
-
   const decl = sig.declaration;
   if (!decl) return { needsAllocator: false, returnsError: false };
-
   if (
     !ts.isFunctionDeclaration(decl) &&
     !ts.isMethodDeclaration(decl) &&
@@ -620,9 +678,29 @@ function analyzeCallee(
     return { needsAllocator: false, returnsError: false };
   }
 
-  const needsAllocator = calleeBodyAllocates(decl, ctx);
-  const returnsError =
+  let needsAllocator = calleeBodyAllocates(decl, ctx);
+  let returnsError =
     needsAllocator || (decl.body ? bodyHasThrow(decl.body) : false);
+
+  if (
+    ts.isMethodDeclaration(decl) &&
+    ts.isPropertyAccessExpression(node.expression)
+  ) {
+    const methodName = node.expression.name.text;
+    const recvType = ctx.checker.getTypeAtLocation(node.expression.expression);
+    const sym = recvType.getSymbol();
+    const className = sym?.getName();
+    if (className && ctx.classRegistry.has(className)) {
+      const virtuals = ctx.classRegistry.virtualMethodsForRoot(
+        ctx.classRegistry.rootOf(className),
+      );
+      if (virtuals.includes(methodName)) {
+        const eff = ctx.classRegistry.methodEffects(className, methodName);
+        needsAllocator = eff.allocates;
+        returnsError = eff.allocates || eff.throws;
+      }
+    }
+  }
 
   return { needsAllocator, returnsError };
 }
@@ -855,6 +933,21 @@ function synthesizeAnonStruct(
   });
 
   return name;
+}
+
+function isAncestorMethodReadOnly(
+  ctx: TransformContext,
+  fromClass: string,
+  methodName: string,
+): boolean {
+  for (const ancestor of ctx.classRegistry.ancestry(fromClass)) {
+    for (const member of ancestor.node.members) {
+      if (!ts.isMethodDeclaration(member)) continue;
+      if (member.name.getText(ctx.sourceFile) !== methodName) continue;
+      return !bodyMutatesThis(member.body);
+    }
+  }
+  return true;
 }
 
 function irTypeKey(t: IRType): string {

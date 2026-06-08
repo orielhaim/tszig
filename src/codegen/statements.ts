@@ -5,6 +5,7 @@ import type {
   IRStruct,
   IRVariable,
   Diagnostic,
+  IRField,
 } from "../types";
 import { ZigWriter } from "./writer";
 import { generateExpr } from "./expressions";
@@ -18,6 +19,8 @@ import {
   incrementTempCounter,
   GenericMap,
   coerce,
+  vtableTypeName,
+  castSelfToOpaque,
 } from "./utils";
 
 export function generateNode(
@@ -37,7 +40,7 @@ export function generateNode(
       generateVariable(node, w, diagnostics, depth, null);
       break;
     case "return":
-      generateReturn(node, w, diagnostics, depth);
+      generateReturn(node, w, diagnostics, depth, null);
       break;
     case "if":
       generateIf(node, w, diagnostics, depth, null);
@@ -68,6 +71,12 @@ export function generateNode(
     case "consoleLog":
       generateConsoleLog(node, w, diagnostics);
       break;
+
+    case "superCall": {
+      w.writeLine(`${generateExpr(node, diagnostics)};`);
+      break;
+    }
+
     case "call": {
       if (needsResultDiscard(node)) {
         w.writeLine(`_ = ${generateExpr(node, diagnostics)};`);
@@ -148,8 +157,13 @@ export function generateFunction(
   w.writeLine(`${pub}fn ${sanitizeName(name)}(${paramStr}) ${returnTypeStr} {`);
   w.indent();
 
+  const functionReturnType =
+    node.returnType.kind === "errorUnion"
+      ? node.returnType.okType
+      : node.returnType;
+
   for (const child of node.body) {
-    generateBodyNode(child, w, diagnostics, depth + 1, gm);
+    generateBodyNode(child, w, diagnostics, depth + 1, gm, functionReturnType);
   }
 
   w.dedent();
@@ -338,26 +352,27 @@ function generateBodyNode(
   diagnostics: Diagnostic[],
   depth: number,
   gm: GenericMap | null,
+  functionReturnType: IRType | null = null,
 ): void {
   switch (node.kind) {
     case "variable":
       generateVariable(node, w, diagnostics, depth, gm);
       break;
     case "return":
-      generateReturn(node, w, diagnostics, depth);
+      generateReturn(node, w, diagnostics, depth, functionReturnType);
       break;
     case "if":
-      generateIf(node, w, diagnostics, depth, gm);
+      generateIf(node, w, diagnostics, depth, gm, functionReturnType);
       break;
     case "while":
-      generateWhile(node, w, diagnostics, depth, gm);
+      generateWhile(node, w, diagnostics, depth, gm, functionReturnType);
       break;
     case "for":
-      generateFor(node, w, diagnostics, depth, gm);
+      generateFor(node, w, diagnostics, depth, gm, functionReturnType);
       break;
     case "block":
       for (const child of (node as any).body) {
-        generateBodyNode(child, w, diagnostics, depth, gm);
+        generateBodyNode(child, w, diagnostics, depth, gm, functionReturnType);
       }
       break;
     case "function":
@@ -377,9 +392,15 @@ function generateStruct(
 ): void {
   const pub = node.isPublic ? "pub " : "";
   const isGenericClass = node.typeParameters && node.typeParameters.length > 0;
-  const classGm: GenericMap | null = isGenericClass
+  let classGm: GenericMap | null = isGenericClass
     ? new Map(node.typeParameters!.map((tp) => [tp, tp]))
     : null;
+  if (node.baseTypeSubst) {
+    classGm = new Map(Object.entries(node.baseTypeSubst));
+  }
+
+  const hasHierarchy =
+    !!node.baseClass || (node.virtualMethods && node.virtualMethods.length > 0);
 
   if (isGenericClass) {
     const typeParams = node
@@ -397,24 +418,32 @@ function generateStruct(
   w.writeLine("const Self = @This();");
   w.writeLine("");
 
-  for (const field of node.fields) {
-    const fieldType = typeToZig(field.type, classGm);
-    if (field.defaultValue) {
-      if ((field.defaultValue as any).kind === "emptyArrayInit") {
-        w.writeLine(`${sanitizeName(field.name)}: ${fieldType} = .empty,`);
-      } else {
-        w.writeLine(
-          `${sanitizeName(field.name)}: ${fieldType} = ${generateExpr(field.defaultValue, diagnostics)},`,
-        );
-      }
-    } else if (field.isOptional || field.type.kind === "optional") {
-      w.writeLine(`${sanitizeName(field.name)}: ${fieldType} = null,`);
-    } else {
-      w.writeLine(`${sanitizeName(field.name)}: ${fieldType},`);
-    }
+  if (hasHierarchy && !node.baseClass) {
+    emitVTableType(node, w, classGm);
+    w.writeLine("");
   }
 
-  if (node.fields.length > 0 && node.methods.length > 0) {
+  if (hasHierarchy) {
+    w.writeLine(`__vptr: *const ${vtableTypeName(node.name)},`);
+  }
+
+  const inherited = node.inheritedFields ?? [];
+  for (const field of inherited) {
+    emitFieldLine(field, w, diagnostics, classGm);
+  }
+  for (const field of node.fields) {
+    emitFieldLine(field, w, diagnostics, classGm);
+  }
+
+  if (hasHierarchy && !node.isAbstract) {
+    w.writeLine("");
+    emitVTableInstance(node, w);
+  }
+
+  if (
+    (node.fields.length > 0 || inherited.length > 0) &&
+    node.methods.length > 0
+  ) {
     w.writeLine("");
   }
 
@@ -428,7 +457,25 @@ function generateStruct(
   for (const method of node.methods) {
     if (method.name === "init") continue;
     w.writeLine("");
-    generateFunction(method, w, diagnostics, depth + 1, classGm);
+    emitMethod(node, method, w, diagnostics, classGm);
+  }
+
+  if (node.baseClass) {
+    const baseType = node.baseInstantiatedType ?? node.baseClass;
+    w.writeLine("");
+    w.writeLine(`pub fn as${node.baseClass}(self: *Self) *${baseType} {`);
+    w.indent();
+    w.writeLine("return @ptrCast(self);");
+    w.dedent();
+    w.writeLine("}");
+    w.writeLine("");
+    w.writeLine(
+      `pub fn as${node.baseClass}Const(self: *const Self) *const ${baseType} {`,
+    );
+    w.indent();
+    w.writeLine("return @ptrCast(self);");
+    w.dedent();
+    w.writeLine("}");
   }
 
   w.dedent();
@@ -439,6 +486,248 @@ function generateStruct(
   }
 }
 
+function emitFieldLine(
+  field: IRField,
+  w: ZigWriter,
+  diagnostics: Diagnostic[],
+  gm: GenericMap | null,
+): void {
+  const fieldType = typeToZig(field.type, gm);
+  if (field.defaultValue) {
+    if ((field.defaultValue as any).kind === "emptyArrayInit") {
+      w.writeLine(`${sanitizeName(field.name)}: ${fieldType} = .empty,`);
+    } else {
+      w.writeLine(
+        `${sanitizeName(field.name)}: ${fieldType} = ${generateExpr(field.defaultValue, diagnostics)},`,
+      );
+    }
+  } else if (field.isOptional || field.type.kind === "optional") {
+    w.writeLine(`${sanitizeName(field.name)}: ${fieldType} = null,`);
+  } else {
+    w.writeLine(`${sanitizeName(field.name)}: ${fieldType},`);
+  }
+}
+
+function vtableOpaqueSelfType(isReadOnly: boolean | undefined): string {
+  return isReadOnly ? "*const anyopaque" : "*anyopaque";
+}
+
+function virtualSlotReturnType(m: IRFunction, gm: GenericMap | null): string {
+  const hierAllocates = (m as any).hierAllocates === true;
+  const hierThrows = (m as any).hierThrows === true;
+  const okType =
+    m.returnType.kind === "errorUnion" ? m.returnType.okType : m.returnType;
+  const okZig = typeToZig(okType, gm);
+  if (hierAllocates || hierThrows) {
+    return `anyerror!${okZig}`;
+  }
+  return okZig;
+}
+
+function emitVTableType(
+  node: IRStruct,
+  w: ZigWriter,
+  gm: GenericMap | null,
+): void {
+  w.writeLine("pub const __VTable = struct {");
+  w.indent();
+  for (const mname of node.virtualMethods ?? []) {
+    const m = node.methods.find((mm) => mm.name === mname);
+    if (!m) {
+      w.writeLine(
+        `${sanitizeName(mname)}: *const fn (self: *const anyopaque) void,`,
+      );
+      continue;
+    }
+    const hierAllocates = (m as any).hierAllocates === true;
+    const parts: string[] = [`self: ${vtableOpaqueSelfType(m.isReadOnly)}`];
+    if (hierAllocates) parts.push("allocator: std.mem.Allocator");
+    for (const p of m.params) {
+      parts.push(`${sanitizeName(p.name)}: ${typeToZig(p.type, gm)}`);
+    }
+    w.writeLine(
+      `${sanitizeName(mname)}: *const fn (${parts.join(", ")}) ${virtualSlotReturnType(m, gm)},`,
+    );
+  }
+  w.dedent();
+  w.writeLine("};");
+}
+
+function emitDispatcher(
+  method: IRFunction,
+  w: ZigWriter,
+  gm: GenericMap | null,
+): void {
+  const constSelf = method.isReadOnly ? "*const Self" : "*Self";
+  const hierAllocates = (method as any).hierAllocates === true;
+  const hierThrows = (method as any).hierThrows === true;
+
+  const params: string[] = [`self: ${constSelf}`];
+  if (hierAllocates) params.push("allocator: std.mem.Allocator");
+  for (const p of method.params) {
+    params.push(`${sanitizeName(p.name)}: ${typeToZig(p.type, gm)}`);
+  }
+  const ret = virtualSlotReturnType(method, gm);
+
+  w.writeLine(
+    `pub fn ${sanitizeName(method.name)}(${params.join(", ")}) ${ret} {`,
+  );
+  w.indent();
+
+  const callArgs: string[] = [castSelfToOpaque("self", method.isReadOnly)];
+  if (hierAllocates) callArgs.push("allocator");
+  for (const p of method.params) callArgs.push(sanitizeName(p.name));
+
+  const callExpr = `self.__vptr.${sanitizeName(method.name)}(${callArgs.join(", ")})`;
+  if (hierAllocates || hierThrows) w.writeLine(`return try ${callExpr};`);
+  else w.writeLine(`return ${callExpr};`);
+
+  w.dedent();
+  w.writeLine("}");
+}
+
+function emitMethodImpl(
+  node: IRStruct,
+  method: IRFunction,
+  w: ZigWriter,
+  diagnostics: Diagnostic[],
+  gm: GenericMap | null,
+): void {
+  const hierAllocates = (method as any).hierAllocates === true;
+  const opaque = vtableOpaqueSelfType(method.isReadOnly);
+
+  const params: string[] = [`__self_opaque: ${opaque}`];
+  if (hierAllocates) params.push("allocator: std.mem.Allocator");
+  for (const p of method.params) {
+    params.push(`${sanitizeName(p.name)}: ${typeToZig(p.type, gm)}`);
+  }
+  const ret = virtualSlotReturnType(method, gm);
+
+  w.writeLine(
+    `pub fn __${sanitizeName(method.name)}_impl(${params.join(", ")}) ${ret} {`,
+  );
+  w.indent();
+  if (method.isReadOnly) {
+    w.writeLine(
+      `const self: *const Self = @ptrCast(@alignCast(__self_opaque));`,
+    );
+  } else {
+    w.writeLine(`const self: *Self = @ptrCast(@alignCast(__self_opaque));`);
+  }
+  w.writeLine(`_ = &self;`);
+  if (hierAllocates) w.writeLine(`_ = &allocator;`);
+  const methodReturnType =
+    method.returnType.kind === "errorUnion"
+      ? method.returnType.okType
+      : method.returnType;
+  for (const child of method.body) {
+    generateBodyNode(child, w, diagnostics, 1, gm, methodReturnType);
+  }
+  w.dedent();
+  w.writeLine("}");
+}
+
+function emitInheritedTrampoline(
+  node: IRStruct,
+  method: IRFunction,
+  w: ZigWriter,
+  gm: GenericMap | null,
+): void {
+  if (method.isVirtual) {
+    emitDispatcher(method, w, gm);
+    return;
+  }
+  const ownerClass = (method as any).ownerClass as string | undefined;
+  if (!ownerClass) {
+    generateFunction(method, w, [], 0, gm);
+    return;
+  }
+  const constSelf = method.isReadOnly ? "*const Self" : "*Self";
+  const params = [`self: ${constSelf}`].concat(
+    method.params.map(
+      (p) => `${sanitizeName(p.name)}: ${typeToZig(p.type, gm)}`,
+    ),
+  );
+  const ret = typeToZig(method.returnType, gm);
+  w.writeLine(
+    `pub fn ${sanitizeName(method.name)}(${params.join(", ")}) ${ret} {`,
+  );
+  w.indent();
+  const ownerSelf = method.isReadOnly
+    ? `*const ${ownerClass}`
+    : `*${ownerClass}`;
+  const callArgs = [`@as(${ownerSelf}, @ptrCast(self))`].concat(
+    method.params.map((p) => sanitizeName(p.name)),
+  );
+  const isErr = method.returnType.kind === "errorUnion";
+  const callExpr = `${ownerClass}.${sanitizeName(method.name)}(${callArgs.join(", ")})`;
+  if (isErr) w.writeLine(`return try ${callExpr};`);
+  else w.writeLine(`return ${callExpr};`);
+  w.dedent();
+  w.writeLine("}");
+}
+
+function emitVTableInstance(node: IRStruct, w: ZigWriter): void {
+  w.writeLine(`pub const __vtable_instance: ${vtableTypeName(node.name)} = .{`);
+  w.indent();
+
+  const virtuals = new Set(node.virtualMethods ?? []);
+
+  for (const mname of virtuals) {
+    const m = node.methods.find((mm) => mm.name === mname);
+    if (m && !m.isAbstract) {
+      const isInherited = (m as any).isInherited === true;
+      const ownerClass = (m as any).ownerClass as string | undefined;
+      if (isInherited && ownerClass && ownerClass !== node.name) {
+        const ownerRef =
+          ownerClass === node.baseClass && node.baseInstantiatedType
+            ? node.baseInstantiatedType
+            : ownerClass;
+        w.writeLine(
+          `.${sanitizeName(mname)} = &${ownerRef}.__${sanitizeName(mname)}_impl,`,
+        );
+      } else {
+        w.writeLine(
+          `.${sanitizeName(mname)} = &Self.__${sanitizeName(mname)}_impl,`,
+        );
+      }
+    } else {
+      w.writeLine(`.${sanitizeName(mname)} = &_rt.__vtable_unreachable,`);
+    }
+  }
+
+  w.dedent();
+  w.writeLine("};");
+}
+
+function emitMethod(
+  node: IRStruct,
+  method: IRFunction,
+  w: ZigWriter,
+  diagnostics: Diagnostic[],
+  gm: GenericMap | null,
+): void {
+  if (!method.isVirtual || method.isStatic) {
+    if ((method as any).isInherited) {
+      emitInheritedTrampoline(node, method, w, gm);
+      return;
+    }
+    generateFunction(method, w, diagnostics, 0, gm);
+    return;
+  }
+
+  if (method.isAbstract) {
+    emitDispatcher(method, w, gm);
+    return;
+  }
+
+  emitDispatcher(method, w, gm);
+  w.writeLine("");
+  if (!(method as any).isInherited) {
+    emitMethodImpl(node, method, w, diagnostics, gm);
+  }
+}
+
 function generateInitMethod(
   struct: IRStruct,
   initMethod: IRFunction,
@@ -446,6 +735,10 @@ function generateInitMethod(
   diagnostics: Diagnostic[],
   gm: GenericMap | null = null,
 ): void {
+  if (struct.isAbstract) {
+    return;
+  }
+
   const params: string[] = [];
   for (const p of initMethod.params) {
     params.push(`${sanitizeName(p.name)}: ${typeToZig(p.type, gm)}`);
@@ -456,10 +749,27 @@ function generateInitMethod(
 
   const initAssignments: Record<string, IRNode> =
     (initMethod as any).initAssignments ?? {};
+  const superCallArgs: IRNode[] | undefined = (initMethod as any).superCallArgs;
+  const hasHierarchy =
+    !!struct.baseClass ||
+    (struct.virtualMethods && struct.virtualMethods.length > 0);
 
+  const allFields = [...(struct.inheritedFields ?? []), ...struct.fields];
   const fieldsToEmit: { name: string; value: string }[] = [];
 
-  for (const field of struct.fields) {
+  const superInitTarget = (initMethod as any).superInitTarget as
+    | string
+    | undefined;
+  let baseTempEmitted = false;
+  if (superInitTarget && superCallArgs) {
+    const argStrs = superCallArgs.map((a) => generateExpr(a, diagnostics));
+    w.writeLine(
+      `const __base = ${superInitTarget}.init(${argStrs.join(", ")});`,
+    );
+    baseTempEmitted = true;
+  }
+
+  for (const field of allFields) {
     if (initAssignments[field.name]) {
       fieldsToEmit.push({
         name: field.name,
@@ -467,39 +777,40 @@ function generateInitMethod(
       });
       continue;
     }
-
     const matchingParam = initMethod.params.find((p) => p.name === field.name);
     if (matchingParam) {
+      fieldsToEmit.push({ name: field.name, value: sanitizeName(field.name) });
+      continue;
+    }
+    const isInherited = (struct.inheritedFields ?? []).some(
+      (f) => f.name === field.name,
+    );
+    if (isInherited && baseTempEmitted) {
       fieldsToEmit.push({
         name: field.name,
-        value: sanitizeName(field.name),
+        value: `__base.${sanitizeName(field.name)}`,
       });
       continue;
     }
-
     if (
       !field.defaultValue &&
       !field.isOptional &&
       field.type.kind !== "optional"
     ) {
-      fieldsToEmit.push({
-        name: field.name,
-        value: "undefined",
-      });
+      fieldsToEmit.push({ name: field.name, value: "undefined" });
     }
   }
 
-  if (fieldsToEmit.length === 0) {
-    w.writeLine("return .{};");
-  } else {
-    w.writeLine("return Self{");
-    w.indent();
-    for (const f of fieldsToEmit) {
-      w.writeLine(`.${sanitizeName(f.name)} = ${f.value},`);
-    }
-    w.dedent();
-    w.writeLine("};");
+  w.writeLine("return Self{");
+  w.indent();
+  if (hasHierarchy) {
+    w.writeLine(`.__vptr = &Self.__vtable_instance,`);
   }
+  for (const f of fieldsToEmit) {
+    w.writeLine(`.${sanitizeName(f.name)} = ${f.value},`);
+  }
+  w.dedent();
+  w.writeLine("};");
 
   w.dedent();
   w.writeLine("}");
@@ -574,8 +885,10 @@ function generateArrayInit(
     w.writeLine(`defer ${sanitizeName(node.name)}.deinit(allocator);`);
   }
 
+  const elemIrType = arrNode.elementType as IRType;
   for (const elem of arrNode.elements) {
-    const elemStr = generateExpr(elem, diagnostics);
+    const raw = generateExpr(elem, diagnostics);
+    const elemStr = coerce(raw, getNodeType(elem), elemIrType);
     w.writeLine(
       `try ${sanitizeName(node.name)}.append(allocator, ${elemStr});`,
     );
@@ -587,9 +900,14 @@ function generateReturn(
   w: ZigWriter,
   diagnostics: Diagnostic[],
   depth: number,
+  functionReturnType: IRType | null,
 ): void {
   if (node.value) {
-    w.writeLine(`return ${generateExpr(node.value, diagnostics)};`);
+    const raw = generateExpr(node.value, diagnostics);
+    const valueStr = functionReturnType
+      ? coerce(raw, getNodeType(node.value), functionReturnType)
+      : raw;
+    w.writeLine(`return ${valueStr};`);
   } else {
     w.writeLine("return;");
   }
@@ -601,6 +919,7 @@ function generateIf(
   diagnostics: Diagnostic[],
   depth: number,
   gm: GenericMap | null,
+  functionReturnType: IRType | null = null,
 ): void {
   if (node.optionalCapture?.polarity === "notNull") {
     const varName = sanitizeName(node.optionalCapture.variable);
@@ -613,7 +932,14 @@ function generateIf(
   w.indent();
   for (const child of node.thenBody) {
     if (gm) {
-      generateBodyNode(child, w, diagnostics, depth + 1, gm);
+      generateBodyNode(
+        child,
+        w,
+        diagnostics,
+        depth + 1,
+        gm,
+        functionReturnType,
+      );
     } else {
       generateNode(child, w, diagnostics, depth + 1);
     }
@@ -625,7 +951,14 @@ function generateIf(
     w.indent();
     for (const child of node.elseBody) {
       if (gm) {
-        generateBodyNode(child, w, diagnostics, depth + 1, gm);
+        generateBodyNode(
+          child,
+          w,
+          diagnostics,
+          depth + 1,
+          gm,
+          functionReturnType,
+        );
       } else {
         generateNode(child, w, diagnostics, depth + 1);
       }
@@ -642,13 +975,21 @@ function generateWhile(
   diagnostics: Diagnostic[],
   depth: number,
   gm: GenericMap | null,
+  functionReturnType: IRType | null = null,
 ): void {
   const cond = generateExpr(node.condition, diagnostics);
   w.writeLine(`while (${cond}) {`);
   w.indent();
   for (const child of node.body) {
     if (gm) {
-      generateBodyNode(child, w, diagnostics, depth + 1, gm);
+      generateBodyNode(
+        child,
+        w,
+        diagnostics,
+        depth + 1,
+        gm,
+        functionReturnType,
+      );
     } else {
       generateNode(child, w, diagnostics, depth + 1);
     }
@@ -663,6 +1004,7 @@ function generateFor(
   diagnostics: Diagnostic[],
   depth: number,
   gm: GenericMap | null,
+  functionReturnType: IRType | null = null,
 ): void {
   if (node.variant === "range") {
     const endRaw = generateExpr(node.end, diagnostics);
@@ -685,7 +1027,15 @@ function generateFor(
     w.writeLine(`for (0..${endStr}) |${sanitizeName(node.itemName)}| {`);
     w.indent();
     for (const child of node.body) {
-      if (gm) generateBodyNode(child, w, diagnostics, depth + 1, gm);
+      if (gm)
+        generateBodyNode(
+          child,
+          w,
+          diagnostics,
+          depth + 1,
+          gm,
+          functionReturnType,
+        );
       else generateNode(child, w, diagnostics, depth + 1);
     }
     w.dedent();
@@ -703,7 +1053,15 @@ function generateFor(
     w.writeLine(`for (${iterable}.items) ${capture} {`);
     w.indent();
     for (const child of node.body) {
-      if (gm) generateBodyNode(child, w, diagnostics, depth + 1, gm);
+      if (gm)
+        generateBodyNode(
+          child,
+          w,
+          diagnostics,
+          depth + 1,
+          gm,
+          functionReturnType,
+        );
       else generateNode(child, w, diagnostics, depth + 1);
     }
     w.dedent();

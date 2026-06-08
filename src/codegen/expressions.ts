@@ -7,6 +7,7 @@ import {
   formatSpecForType,
   isArithmeticOp,
   coerce,
+  castSelfToOpaque,
 } from "./utils";
 
 export function generateExpr(node: IRNode, diagnostics: Diagnostic[]): string {
@@ -65,16 +66,21 @@ export function generateExpr(node: IRNode, diagnostics: Diagnostic[]): string {
         calleeNode.objectType?.kind === "array"
       ) {
         const obj = generateExpr(calleeNode.object, diagnostics);
-        const args = (node as any).args.map((a: IRNode) =>
-          generateExpr(a, diagnostics),
-        );
+        const elemType = calleeNode.objectType.elementType;
+        const args = (node as any).args.map((a: IRNode) => {
+          const raw = generateExpr(a, diagnostics);
+          return coerce(raw, getNodeType(a), elemType);
+        });
         return `try ${obj}.append(allocator, ${args.join(", ")})`;
       }
 
       const callee = generateExpr(calleeNode, diagnostics);
-      const userArgs = (node as any).args.map((a: IRNode) =>
-        generateExpr(a, diagnostics),
-      );
+      const paramTypes = (node as any).paramTypes as IRType[] | undefined;
+      const userArgs = (node as any).args.map((a: IRNode, i: number) => {
+        const raw = generateExpr(a, diagnostics);
+        const paramType = paramTypes?.[i];
+        return paramType ? coerce(raw, getNodeType(a), paramType) : raw;
+      });
 
       const fullArgs: string[] = [];
 
@@ -91,6 +97,26 @@ export function generateExpr(node: IRNode, diagnostics: Diagnostic[]): string {
       }
 
       return callStr;
+    }
+
+    case "superCall": {
+      const sc = node as any;
+      const parent = sc.parentClass as string;
+      const method = sc.method as string;
+      const args = (sc.args as IRNode[]).map((a) =>
+        generateExpr(a, diagnostics),
+      );
+      if (method === "constructor") {
+        return `${parent}.init(${args.join(", ")})`;
+      }
+      const callArgs: string[] = [
+        castSelfToOpaque("self", sc.isReadOnly !== false),
+      ];
+      if (sc.hierAllocates) callArgs.push("allocator");
+      callArgs.push(...args);
+      const callExpr = `${parent}.__${sanitizeName(method)}_impl(${callArgs.join(", ")})`;
+      if (sc.hierAllocates || sc.hierThrows) return `try ${callExpr}`;
+      return callExpr;
     }
 
     case "member":

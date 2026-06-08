@@ -1,6 +1,99 @@
-import type { IRNode, IRType } from "../types";
+import type { IRModule, IRNode, IRType } from "../types";
 
 let _tempVarCounter = 0;
+
+type StructInfo = {
+  baseClass?: string;
+  ownFieldCount: number;
+  isAbstract?: boolean;
+  typeParameters?: string[];
+  baseInstantiatedType?: string;
+};
+let structHierarchy = new Map<string, StructInfo>();
+
+export function initStructHierarchy(module: IRModule): void {
+  structHierarchy = new Map();
+  for (const node of module.body) {
+    if (node.kind === "struct") {
+      structHierarchy.set(node.name, {
+        baseClass: node.baseClass,
+        ownFieldCount: node.fields.length,
+        isAbstract: node.isAbstract ?? false,
+        typeParameters: node.typeParameters,
+        baseInstantiatedType: node.baseInstantiatedType,
+      });
+    }
+  }
+}
+
+export function hierarchyRootName(className: string): string {
+  let cur: string | undefined = className;
+  while (cur) {
+    const info = structHierarchy.get(cur);
+    if (!info?.baseClass) return cur;
+    cur = info.baseClass;
+  }
+  return className;
+}
+
+function findBaseInstantiation(className: string): string | undefined {
+  let cur: string | undefined = className;
+  while (cur) {
+    const info = structHierarchy.get(cur);
+    if (info?.baseInstantiatedType) return info.baseInstantiatedType;
+    cur = info?.baseClass;
+  }
+  return undefined;
+}
+
+export function vtableTypeName(className: string): string {
+  const info = structHierarchy.get(className);
+  if (info?.typeParameters?.length && !info.baseClass) {
+    return "__VTable";
+  }
+  const inst = findBaseInstantiation(className);
+  if (inst) return `${inst}.__VTable`;
+  return `${hierarchyRootName(className)}.__VTable`;
+}
+
+export function structTypeRef(className: string): string {
+  const inst = findBaseInstantiation(className);
+  if (inst && className !== hierarchyRootName(className)) {
+    return inst;
+  }
+  return className;
+}
+
+export function castSelfToOpaque(
+  selfExpr: string,
+  isReadOnly?: boolean,
+): string {
+  const opaque = isReadOnly !== false ? "*const anyopaque" : "*anyopaque";
+  return `@as(${opaque}, @ptrCast(${selfExpr}))`;
+}
+
+function canUpcastToBase(derived: string, base: string): boolean {
+  let cur: string | undefined = derived;
+  while (cur && cur !== base) {
+    const info = structHierarchy.get(cur);
+    if (!info) return false;
+    if (info.ownFieldCount > 0) return false;
+    cur = info.baseClass;
+  }
+  return cur === base;
+}
+
+function upcastToBaseExpr(expr: string, derived: string, base: string): string {
+  let cur = derived;
+  let result = expr;
+  while (cur !== base) {
+    const info = structHierarchy.get(cur);
+    if (!info?.baseClass) return expr;
+    result = `${result}.as${info.baseClass}Const()`;
+    cur = info.baseClass;
+  }
+  return `${result}.*`;
+}
 
 export function getTempCounter(): number {
   return _tempVarCounter;
@@ -254,6 +347,15 @@ export function coerce(
     return `@as(${(to as any).name}, ${expr})`;
   }
 
+  if (
+    from.kind === "struct" &&
+    to.kind === "struct" &&
+    from.name !== to.name &&
+    canUpcastToBase(from.name, to.name)
+  ) {
+    return upcastToBaseExpr(expr, from.name, to.name);
+  }
+
   return expr;
 }
 
@@ -284,6 +386,12 @@ export function getNodeType(node: IRNode): IRType {
   }
 
   if (node.kind === "templateLiteral") return { kind: "string" };
+
+  if (node.kind === "superCall") {
+    const rt = (node as any).resultType as IRType | undefined;
+    if (rt) return rt;
+    return { kind: "unknown" };
+  }
 
   if (node.kind === "nullishCoalesce") return getNodeType((node as any).right);
 

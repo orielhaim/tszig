@@ -1,9 +1,10 @@
 import * as ts from "typescript";
 import type { TransformContext } from "../index";
+import { withBindingTypes } from "../bindings";
 import { transformExpression } from "./expressions";
 import { transformVariable } from "./variables";
 import { resolveType } from "../../analyzer/type-resolver";
-import type { IRIfStatement, IRNode } from "../../types";
+import type { IRIfStatement, IRNode, IRType } from "../../types";
 
 export function transformStatement(
   node: ts.Node,
@@ -276,9 +277,15 @@ function transformForOf(
   }
 
   const iterable = transformExpression(node.expression, ctx);
-  const body = transformStatementToBody(node.statement, ctx);
-
   const itemType = resolveIterationItemType(node, ctx);
+  const itemBindings = new Map<string, IRType>();
+  if (itemType) {
+    itemBindings.set(itemName, itemType);
+  }
+
+  const body = withBindingTypes(ctx, itemBindings, () =>
+    transformStatementToBody(node.statement, ctx),
+  );
   const needsMutable = detectMutableUsageInForOf(node, itemName, ctx);
 
   const result: any = {
@@ -357,7 +364,12 @@ function resolveIterationItemType(
   if (ctx.checker.isArrayType(exprType)) {
     const typeArgs = (exprType as any).typeArguments;
     if (typeArgs && typeArgs.length > 0) {
-      return resolveType(typeArgs[0], ctx.checker);
+      return resolveType(
+        typeArgs[0],
+        ctx.checker,
+        undefined,
+        ctx.numericClassifier,
+      );
     }
   }
   return null;

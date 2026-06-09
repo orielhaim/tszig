@@ -2,6 +2,13 @@ import * as ts from "typescript";
 import type { TransformContext } from "../index";
 import { blockAllocates, bodyMutatesThis } from "../../analyzer/allocation";
 import { resolveType, resolveTypeFromNode } from "../../analyzer/type-resolver";
+import {
+  paramBindingsFromParams,
+  resolveFieldType,
+  resolveParamType,
+  resolveReturnType,
+  withBindingTypes,
+} from "../bindings";
 import { transformExpression } from "./expressions";
 import { replaceGenericTypes, suppressDeferForEscapingVars } from "./functions";
 import { transformStatement } from "./statements";
@@ -348,9 +355,7 @@ function buildFieldFromProperty(
   typeParamNames: Set<string>,
 ): IRField | null {
   const fieldName = member.name.getText(ctx.sourceFile);
-  let fieldType: IRType = member.type
-    ? resolveTypeFromNode(member.type, ctx.checker, ctx.sourceFile)
-    : resolveType(ctx.checker.getTypeAtLocation(member), ctx.checker);
+  let fieldType = resolveFieldType(member, ctx);
 
   const isOptional = !!member.questionToken;
   let defaultValue: IRNode | undefined;
@@ -361,7 +366,7 @@ function buildFieldFromProperty(
     ) {
       defaultValue = { kind: "emptyArrayInit" } as any;
     } else {
-      defaultValue = transformExpression(member.initializer, ctx);
+      defaultValue = transformExpression(member.initializer, ctx, fieldType);
     }
   }
 
@@ -402,9 +407,7 @@ function buildConstructorParams(
   const params: IRParam[] = [];
   for (const param of member.parameters) {
     const paramName = param.name.getText(ctx.sourceFile);
-    let paramType: IRType = param.type
-      ? resolveTypeFromNode(param.type, ctx.checker, ctx.sourceFile)
-      : resolveType(ctx.checker.getTypeAtLocation(param), ctx.checker);
+    let paramType = resolveParamType(param, ctx);
     if (typeParamNames.size > 0) {
       paramType = replaceGenericTypes(paramType, typeParamNames);
     }
@@ -547,9 +550,7 @@ function buildConstructor(
 
   for (const param of member.parameters) {
     const paramName = param.name.getText(ctx.sourceFile);
-    let paramType = param.type
-      ? resolveTypeFromNode(param.type, ctx.checker, ctx.sourceFile)
-      : resolveType(ctx.checker.getTypeAtLocation(param), ctx.checker);
+    let paramType = resolveParamType(param, ctx);
     if (typeParamNames.size > 0) {
       paramType = replaceGenericTypes(paramType, typeParamNames);
     }
@@ -581,25 +582,27 @@ function buildConstructor(
   let superCallArgs: IRNode[] | undefined;
 
   if (member.body) {
-    for (const stmt of member.body.statements) {
-      if (
-        ts.isExpressionStatement(stmt) &&
-        ts.isCallExpression(stmt.expression) &&
-        stmt.expression.expression.kind === ts.SyntaxKind.SuperKeyword
-      ) {
-        superCallArgs = stmt.expression.arguments.map((a) =>
-          transformExpression(a, ctx),
-        );
-        continue;
+    withBindingTypes(ctx, paramBindingsFromParams(params), () => {
+      for (const stmt of member.body!.statements) {
+        if (
+          ts.isExpressionStatement(stmt) &&
+          ts.isCallExpression(stmt.expression) &&
+          stmt.expression.expression.kind === ts.SyntaxKind.SuperKeyword
+        ) {
+          superCallArgs = stmt.expression.arguments.map((a) =>
+            transformExpression(a, ctx),
+          );
+          continue;
+        }
+        const thisAssignment = extractThisAssignment(stmt, ctx);
+        if (thisAssignment) {
+          initAssignments.set(thisAssignment.field, thisAssignment.value);
+        } else {
+          const r = transformStatement(stmt, ctx);
+          if (r) otherStatements.push(r);
+        }
       }
-      const thisAssignment = extractThisAssignment(stmt, ctx);
-      if (thisAssignment) {
-        initAssignments.set(thisAssignment.field, thisAssignment.value);
-      } else {
-        const r = transformStatement(stmt, ctx);
-        if (r) otherStatements.push(r);
-      }
-    }
+    });
   }
 
   let resolvedSuperInitTarget: string | undefined;
@@ -652,9 +655,7 @@ function buildMethod(
 
   for (const param of member.parameters) {
     const paramName = param.name.getText(ctx.sourceFile);
-    let paramType: IRType = param.type
-      ? resolveTypeFromNode(param.type, ctx.checker, ctx.sourceFile)
-      : resolveType(ctx.checker.getTypeAtLocation(param), ctx.checker);
+    let paramType = resolveParamType(param, ctx);
     if (typeParamNames.size > 0) {
       paramType = replaceGenericTypes(paramType, typeParamNames);
     }
@@ -665,15 +666,7 @@ function buildMethod(
     });
   }
 
-  let returnType: IRType;
-  if (member.type) {
-    returnType = resolveTypeFromNode(member.type, ctx.checker, ctx.sourceFile);
-  } else {
-    const sig = ctx.checker.getSignatureFromDeclaration(member);
-    returnType = sig
-      ? resolveType(ctx.checker.getReturnTypeOfSignature(sig), ctx.checker)
-      : { kind: "primitive", name: "void" };
-  }
+  let returnType = resolveReturnType(member, ctx);
   if (typeParamNames.size > 0) {
     returnType = replaceGenericTypes(returnType, typeParamNames);
   }
@@ -686,10 +679,12 @@ function buildMethod(
 
   const body: IRNode[] = [];
   if (member.body) {
-    for (const stmt of member.body.statements) {
-      const r = transformStatement(stmt, ctx);
-      if (r) body.push(r);
-    }
+    withBindingTypes(ctx, paramBindingsFromParams(params), () => {
+      for (const stmt of member.body!.statements) {
+        const r = transformStatement(stmt, ctx);
+        if (r) body.push(r);
+      }
+    });
   }
 
   suppressDeferForEscapingVars(body);

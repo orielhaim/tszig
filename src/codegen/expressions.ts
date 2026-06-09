@@ -9,6 +9,9 @@ import {
   isArithmeticOp,
   coerce,
   castSelfToOpaque,
+  isSignedIntegerType,
+  commonNumericType,
+  wrapBinaryChild,
 } from "./utils";
 
 export function generateExpr(node: IRNode, diagnostics: Diagnostic[]): string {
@@ -23,9 +26,21 @@ export function generateExpr(node: IRNode, diagnostics: Diagnostic[]): string {
       return `${sanitizeName((node as any).base)}(${(node as any).typeArg})`;
 
     case "binary": {
-      const left = generateExpr((node as any).left, diagnostics);
-      const right = generateExpr((node as any).right, diagnostics);
+      const leftNode = (node as any).left;
+      const rightNode = (node as any).right;
       const op = (node as any).operator;
+      const left = wrapBinaryChild(
+        leftNode,
+        generateExpr(leftNode, diagnostics),
+        op,
+        false,
+      );
+      const right = wrapBinaryChild(
+        rightNode,
+        generateExpr(rightNode, diagnostics),
+        op,
+        true,
+      );
 
       if (
         op === "+" &&
@@ -49,34 +64,100 @@ export function generateExpr(node: IRNode, diagnostics: Diagnostic[]): string {
             ? { kind: "primitive", name: "f64" }
             : resultType;
 
-        const leftCoerced = coerce(left, lt, target);
-        const rightCoerced = coerce(right, rt, target);
-        if (
-          op === "%" &&
-          target.kind === "primitive" &&
-          target.name === "f64"
-        ) {
+        const i64Target: IRType = { kind: "primitive", name: "i64" };
+        const f64Target: IRType = { kind: "primitive", name: "f64" };
+        const bothSignedInt =
+          isSignedIntegerType(lt) && isSignedIntegerType(rt);
+
+        if (op === "/") {
+          if (bothSignedInt) {
+            if (isSignedIntegerType(target)) {
+              const leftCoerced = coerce(left, lt, i64Target);
+              const rightCoerced = coerce(right, rt, i64Target);
+              return `@divTrunc(${leftCoerced}, ${rightCoerced})`;
+            }
+            const leftCoerced = coerce(left, lt, f64Target);
+            const rightCoerced = coerce(right, rt, f64Target);
+            return `${leftCoerced} / ${rightCoerced}`;
+          }
+          const leftCoerced = coerce(left, lt, target);
+          const rightCoerced = coerce(right, rt, target);
+          return `${leftCoerced} / ${rightCoerced}`;
+        }
+
+        if (op === "%") {
+          const modTarget =
+            bothSignedInt && isSignedIntegerType(target) ? i64Target : target;
+          const leftCoerced = coerce(left, lt, modTarget);
+          const rightCoerced = coerce(right, rt, modTarget);
+          if (bothSignedInt) {
+            return `@rem(${leftCoerced}, ${rightCoerced})`;
+          }
           return `@rem(${leftCoerced}, ${rightCoerced})`;
         }
+
+        const leftCoerced = coerce(left, lt, target);
+        const rightCoerced = coerce(right, rt, target);
         return `${leftCoerced} ${op} ${rightCoerced}`;
       }
 
-      if (op === "==" || op === "!=") {
+      if (
+        op === "==" ||
+        op === "!=" ||
+        op === "<" ||
+        op === "<=" ||
+        op === ">" ||
+        op === ">="
+      ) {
         const lt = getNodeType((node as any).left);
         const rt = getNodeType((node as any).right);
-        if (lt.kind === "string" || rt.kind === "string") {
+        if (
+          (op === "==" || op === "!=") &&
+          (lt.kind === "string" || rt.kind === "string")
+        ) {
           const cmp = `std.mem.eql(u8, ${left}, ${right})`;
           return op === "==" ? cmp : `!${cmp}`;
         }
+        const target = commonNumericType(lt, rt);
+        if (target) {
+          const leftCoerced = coerce(left, lt, target);
+          const rightCoerced = coerce(right, rt, target);
+          if (op === "==" || op === "!=") {
+            return `${leftCoerced} ${op} ${rightCoerced}`;
+          }
+          return `${leftCoerced} ${op} ${rightCoerced}`;
+        }
+      }
+
+      if (
+        op === "|" ||
+        op === "&" ||
+        op === "^" ||
+        op === "<<" ||
+        op === ">>"
+      ) {
+        const lt = getNodeType((node as any).left);
+        const rt = getNodeType((node as any).right);
+        const intTarget: IRType = { kind: "primitive", name: "i64" };
+        const leftCoerced = coerce(left, lt, intTarget);
+        const rightCoerced = coerce(right, rt, intTarget);
+        return `${leftCoerced} ${op} ${rightCoerced}`;
       }
 
       return `${left} ${op} ${right}`;
     }
 
     case "unary": {
-      const operand = generateExpr((node as any).operand, diagnostics);
-      if ((node as any).operator === "+") return operand;
-      return `${(node as any).operator}${operand}`;
+      const operandNode = (node as any).operand as IRNode;
+      const operand = generateExpr(operandNode, diagnostics);
+      const op = (node as any).operator as string;
+      if (op === "+") return operand;
+      const raw = `${op}${operand}`;
+      const resultType = (node as any).resultType as IRType | undefined;
+      if (resultType) {
+        return coerce(raw, getNodeType(operandNode), resultType);
+      }
+      return raw;
     }
 
     case "call": {
@@ -144,14 +225,28 @@ export function generateExpr(node: IRNode, diagnostics: Diagnostic[]): string {
     case "member":
       return `${generateExpr((node as any).object, diagnostics)}.${sanitizeName((node as any).property)}`;
 
-    case "index":
-      return `${generateExpr((node as any).object, diagnostics)}[${generateExpr((node as any).index, diagnostics)}]`;
+    case "index": {
+      const objectNode = (node as any).object as IRNode;
+      const objectExpr = generateExpr(objectNode, diagnostics);
+      const indexExpr = generateExpr((node as any).index, diagnostics);
+      const objectType = getNodeType(objectNode);
+      if (objectType.kind === "array") {
+        return `${objectExpr}.items[${indexExpr}]`;
+      }
+      return `${objectExpr}[${indexExpr}]`;
+    }
 
     case "arrayLiteral": {
       if ((node as any).isTuple) {
-        const elems = (node as any).elements.map((e: IRNode) =>
-          generateExpr(e, diagnostics),
-        );
+        const tupleTypes = (node as any).tupleElementTypes as
+          | IRType[]
+          | undefined;
+        const elems = (node as any).elements.map((e: IRNode, i: number) => {
+          const raw = generateExpr(e, diagnostics);
+          const target = tupleTypes?.[i];
+          if (!target) return raw;
+          return coerce(raw, getNodeType(e), target);
+        });
         return `.{ ${elems.join(", ")} }`;
       }
       return `// inline array literal`;
@@ -193,8 +288,20 @@ export function generateExpr(node: IRNode, diagnostics: Diagnostic[]): string {
       return `std.fmt.allocPrint(allocator, "${formatParts.join("")}"${argParts.length > 0 ? `, .{${argParts.join(", ")}}` : ", .{}"}) catch unreachable`;
     }
 
-    case "nullishCoalesce":
-      return `${generateExpr((node as any).left, diagnostics)} orelse ${generateExpr((node as any).right, diagnostics)}`;
+    case "nullishCoalesce": {
+      const leftNode = (node as any).left as IRNode;
+      const rightNode = (node as any).right as IRNode;
+      const left = generateExpr(leftNode, diagnostics);
+      const right = generateExpr(rightNode, diagnostics);
+      const lt = getNodeType(leftNode);
+      const rt = getNodeType(rightNode);
+      const target =
+        ((node as any).resultType as IRType | undefined) ??
+        commonNumericType(lt, rt) ??
+        rt;
+      const rightCoerced = coerce(right, rt, target);
+      return `${left} orelse ${rightCoerced}`;
+    }
 
     case "optionalChain":
       return `if (${generateExpr((node as any).object, diagnostics)}) |val| val.${sanitizeName((node as any).property)} else null`;
@@ -215,16 +322,17 @@ function generateLiteral(node: any): string {
   if (typeof node.value === "boolean") return node.value ? "true" : "false";
   if (typeof node.value === "string") return `"${escapeZigString(node.value)}"`;
   if (typeof node.value === "number") {
-    if (Number.isInteger(node.value)) {
-      const irType = node.type as IRType | undefined;
-      if (irType?.kind === "primitive") {
-        if (irType.name === "f64") return `@as(f64, ${node.value})`;
-        if (irType.name === "usize") return `@as(usize, ${node.value})`;
-        if (irType.name === "i64") return `@as(i64, ${node.value})`;
+    const v = node.value as number;
+    const irType = node.type as IRType | undefined;
+    if (Number.isInteger(v) && irType?.kind === "primitive") {
+      if (irType.name === "f64") {
+        return v < 0 ? `-${Math.abs(v)}.0` : `${v}.0`;
       }
-      return `${node.value}`;
+      if (irType.name === "i64" || irType.name === "usize") {
+        return `${v}`;
+      }
     }
-    return `${node.value}`;
+    return `${v}`;
   }
   return "undefined";
 }

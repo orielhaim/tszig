@@ -10,8 +10,128 @@ import {
   resolveArrayElementTypeFromContext,
   resolveNamedTypeForExpression,
 } from "../../analyzer/type-resolver";
+import {
+  isIntegerNumericText,
+  type InferredNumericKind,
+} from "../../analyzer/numeric-classifier";
 import { transformStatement } from "./statements";
 import type { IRField, IRNode, IRType } from "../../types";
+
+function isNumericIrType(type: IRType): boolean {
+  return (
+    type.kind === "primitive" &&
+    (type.name === "f64" || type.name === "i64" || type.name === "usize")
+  );
+}
+
+function nullishCoalesceResultType(left: IRType, right: IRType): IRType {
+  const unwrap = (t: IRType): IRType =>
+    t.kind === "optional" ? unwrap(t.inner) : t;
+  const l = unwrap(left);
+  const r = unwrap(right);
+  if (l.kind === "primitive" && l.name === "f64") {
+    return { kind: "primitive", name: "f64" };
+  }
+  if (r.kind === "primitive" && r.name === "f64") {
+    return { kind: "primitive", name: "f64" };
+  }
+  if (l.kind === "primitive" && (l.name === "i64" || l.name === "usize")) {
+    return l;
+  }
+  return r;
+}
+
+function resolveParameterIrType(
+  param: ts.Symbol,
+  ctx: TransformContext,
+): IRType {
+  const paramDecl = param.valueDeclaration;
+  const paramSym = paramDecl
+    ? ctx.checker.getSymbolAtLocation(
+        (paramDecl as ts.ParameterDeclaration).name,
+      )
+    : undefined;
+
+  if (paramDecl && ts.isParameter(paramDecl) && paramDecl.type) {
+    const resolved = resolveTypeFromNode(
+      paramDecl.type,
+      ctx.checker,
+      ctx.sourceFile,
+      paramSym ?? undefined,
+      ctx.numericClassifier,
+    );
+    if (
+      ctx.numericClassifier &&
+      paramSym &&
+      resolved.kind === "primitive" &&
+      isNumericIrType(resolved)
+    ) {
+      return {
+        kind: "primitive",
+        name: ctx.numericClassifier.getBindingNumericKind(paramSym),
+      };
+    }
+    return resolved;
+  }
+
+  return resolveType(
+    ctx.checker.getTypeOfSymbol(param),
+    ctx.checker,
+    paramSym ?? undefined,
+    ctx.numericClassifier,
+  );
+}
+
+function resolveExprType(
+  node: ts.Expression,
+  ctx: TransformContext,
+  symbol?: ts.Symbol,
+): IRType {
+  if (ts.isIdentifier(node)) {
+    const bound = ctx.bindingTypes?.get(node.text);
+    if (bound) return bound;
+  }
+
+  const tsType = ctx.checker.getTypeAtLocation(node);
+  const isNumber =
+    !!(tsType.flags & ts.TypeFlags.Number) ||
+    !!(tsType.flags & ts.TypeFlags.NumberLiteral);
+
+  if (!isNumber) {
+    return resolveType(tsType, ctx.checker, symbol, ctx.numericClassifier);
+  }
+
+  if (ctx.numericClassifier) {
+    const kind = ctx.numericClassifier.getExpressionKind(node);
+    return { kind: "primitive", name: kind };
+  }
+
+  return resolveType(tsType, ctx.checker, symbol, undefined);
+}
+
+function literalPrimitiveName(
+  node: ts.NumericLiteral,
+  ctx: TransformContext,
+  typeHint?: IRType,
+  contextSymbol?: ts.Symbol,
+): InferredNumericKind {
+  if (typeHint?.kind === "primitive") {
+    if (
+      typeHint.name === "i64" ||
+      typeHint.name === "usize" ||
+      typeHint.name === "f64"
+    ) {
+      return typeHint.name;
+    }
+  }
+
+  if (ctx.numericClassifier) {
+    return ctx.numericClassifier.getLiteralKind(node, contextSymbol);
+  }
+
+  const value = Number.parseFloat(node.text);
+  return isIntegerNumericText(node.text, value) ? "i64" : "f64";
+}
 
 export function transformExpression(
   node: ts.Expression,
@@ -20,10 +140,11 @@ export function transformExpression(
 ): IRNode {
   // Numeric literal
   if (ts.isNumericLiteral(node)) {
+    const primitiveName = literalPrimitiveName(node, ctx, typeHint);
     return {
       kind: "literal",
-      value: parseFloat(node.text),
-      type: { kind: "primitive", name: "f64" },
+      value: Number.parseFloat(node.text),
+      type: { kind: "primitive", name: primitiveName },
     };
   }
 
@@ -88,7 +209,8 @@ export function transformExpression(
 
   // Identifier
   if (ts.isIdentifier(node)) {
-    const type = resolveType(ctx.checker.getTypeAtLocation(node), ctx.checker);
+    const sym = ctx.checker.getSymbolAtLocation(node);
+    const type = resolveExprType(node, ctx, sym ?? undefined);
     return { kind: "identifier", name: node.text, type };
   }
 
@@ -164,17 +286,21 @@ export function transformExpression(
     }
 
     if (node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken) {
+      const leftType = resolveExprType(node.left, ctx);
+      const rightType = resolveExprType(node.right, ctx);
+      const resultType = nullishCoalesceResultType(leftType, rightType);
       return {
         kind: "nullishCoalesce",
-        left: transformExpression(node.left, ctx),
-        right: transformExpression(node.right, ctx),
+        left: transformExpression(node.left, ctx, leftType),
+        right: transformExpression(node.right, ctx, resultType),
+        resultType,
       };
     }
 
-    const resultType = resolveType(
-      ctx.checker.getTypeAtLocation(node),
-      ctx.checker,
-    );
+    let resultType = resolveExprType(node, ctx);
+    if (node.operatorToken.kind === ts.SyntaxKind.SlashToken) {
+      resultType = { kind: "primitive", name: "f64" };
+    }
 
     return {
       kind: "binary",
@@ -187,11 +313,20 @@ export function transformExpression(
 
   // Unary prefix
   if (ts.isPrefixUnaryExpression(node)) {
+    const operandType = resolveExprType(node.operand, ctx);
+    const resultType =
+      typeHint?.kind === "primitive" &&
+      (typeHint.name === "i64" ||
+        typeHint.name === "usize" ||
+        typeHint.name === "f64")
+        ? typeHint
+        : operandType;
     return {
       kind: "unary",
       operator: mapPrefixUnaryOperator(node.operator),
-      operand: transformExpression(node.operand, ctx),
+      operand: transformExpression(node.operand, ctx, typeHint),
       prefix: true,
+      resultType,
     };
   }
 
@@ -207,9 +342,9 @@ export function transformExpression(
         right: {
           kind: "literal",
           value: 1,
-          type: { kind: "primitive", name: "f64" },
+          type: { kind: "primitive", name: "i64" },
         },
-        resultType: { kind: "primitive", name: "f64" },
+        resultType: resolveExprType(node.operand, ctx),
       },
       operator: "=",
     };
@@ -223,6 +358,27 @@ export function transformExpression(
       return { kind: "consoleLog", args };
     }
 
+    const mathFn = getMathRuntimeFn(node);
+    if (mathFn) {
+      const args = node.arguments.map((a) => transformExpression(a, ctx));
+      return {
+        kind: "call",
+        callee: {
+          kind: "member",
+          object: {
+            kind: "identifier",
+            name: "_rt",
+            type: { kind: "unknown" },
+          },
+          property: mathFn,
+          objectType: { kind: "unknown" },
+        },
+        args,
+        resultType: { kind: "primitive", name: "f64" },
+        paramTypes: [{ kind: "primitive", name: "f64" }],
+      };
+    }
+
     const callee = transformExpression(node.expression, ctx);
 
     const sig = ctx.checker.getResolvedSignature(node);
@@ -231,8 +387,7 @@ export function transformExpression(
       if (sig) {
         const param = sig.parameters[i];
         if (param) {
-          const paramType = ctx.checker.getTypeOfSymbol(param);
-          argTypeHint = resolveType(paramType, ctx.checker);
+          argTypeHint = resolveParameterIrType(param, ctx);
         }
       }
       return transformExpression(a, ctx, argTypeHint);
@@ -263,16 +418,21 @@ export function transformExpression(
       }
     }
 
-    const resultType = resolveCallResultType(node, ctx);
+    let resultType = resolveCallResultType(node, ctx);
+    if (
+      callee.kind === "member" &&
+      callee.property === "append" &&
+      callee.objectType?.kind === "array"
+    ) {
+      resultType = { kind: "primitive", name: "void" };
+    }
 
     const calleeAnalysis = analyzeCallee(node, ctx);
 
     const paramTypes: IRType[] = [];
     if (sig) {
       for (const param of sig.parameters) {
-        paramTypes.push(
-          resolveType(ctx.checker.getTypeOfSymbol(param), ctx.checker),
-        );
+        paramTypes.push(resolveParameterIrType(param, ctx));
       }
     }
 
@@ -288,10 +448,7 @@ export function transformExpression(
   }
 
   if (ts.isPropertyAccessExpression(node)) {
-    const objectType = resolveType(
-      ctx.checker.getTypeAtLocation(node.expression),
-      ctx.checker,
-    );
+    const objectType = resolveExprType(node.expression, ctx);
 
     if (node.name.text === "length" && objectType.kind === "array") {
       return {
@@ -318,10 +475,7 @@ export function transformExpression(
       };
     }
 
-    const resultType = resolveType(
-      ctx.checker.getTypeAtLocation(node),
-      ctx.checker,
-    );
+    const resultType = resolveExprType(node, ctx);
 
     return {
       kind: "member",
@@ -346,6 +500,7 @@ export function transformExpression(
     const contextElementType = resolveArrayElementTypeFromContext(
       node,
       ctx.checker,
+      ctx.numericClassifier,
     );
     if (contextElementType && contextElementType.kind !== "unknown") {
       elementType = contextElementType;
@@ -354,7 +509,12 @@ export function transformExpression(
       if (ctx.checker.isArrayType(tsType)) {
         const typeArgs = (tsType as ts.TypeReference).typeArguments;
         if (typeArgs && typeArgs.length > 0) {
-          elementType = resolveType(typeArgs[0], ctx.checker);
+          elementType = resolveType(
+            typeArgs[0],
+            ctx.checker,
+            undefined,
+            ctx.numericClassifier,
+          );
         }
       }
     }
@@ -365,16 +525,30 @@ export function transformExpression(
       }
     }
 
-    const elements = node.elements.map((e) =>
-      transformExpression(e, ctx, elementType),
-    );
-
     const contextualType = ctx.checker.getContextualType(node);
     const isTuple = !!(
       contextualType && ctx.checker.isTupleType(contextualType)
     );
 
-    return { kind: "arrayLiteral", elements, elementType, isTuple };
+    let tupleElementTypes: IRType[] | undefined;
+    if (isTuple && contextualType) {
+      tupleElementTypes =
+        contextualType.typeArguments?.map((t) =>
+          resolveType(t, ctx.checker, undefined, ctx.numericClassifier),
+        ) ?? [];
+    }
+
+    const elements = node.elements.map((e, i) =>
+      transformExpression(e, ctx, tupleElementTypes?.[i] ?? elementType),
+    );
+
+    return {
+      kind: "arrayLiteral",
+      elements,
+      elementType,
+      isTuple,
+      tupleElementTypes,
+    };
   }
 
   // Object literal
@@ -390,7 +564,13 @@ export function transformExpression(
       if (!propSymbol) return undefined;
       const propType = ctx.checker.getTypeOfSymbolAtLocation(propSymbol, node);
       if (!propType) return undefined;
-      return resolveType(propType, ctx.checker);
+      const propSym = ctx.checker.getSymbolAtLocation(propSymbol);
+      return resolveType(
+        propType,
+        ctx.checker,
+        propSym ?? undefined,
+        ctx.numericClassifier,
+      );
     };
 
     for (const prop of node.properties) {
@@ -408,11 +588,7 @@ export function transformExpression(
         const targetType = targetTypeForField(name);
         properties.push({
           name,
-          value: {
-            kind: "identifier",
-            name,
-            type: { kind: "unknown" },
-          },
+          value: transformExpression(prop.name, ctx, targetType),
           targetType,
         });
       }
@@ -528,17 +704,62 @@ function resolveCallResultType(
   node: ts.CallExpression,
   ctx: TransformContext,
 ): IRType {
+  const sig = ctx.checker.getResolvedSignature(node);
   const tsType = ctx.checker.getTypeAtLocation(node);
-  const resolved = resolveType(tsType, ctx.checker);
+  const resolved = resolveType(
+    tsType,
+    ctx.checker,
+    undefined,
+    ctx.numericClassifier,
+  );
+
+  if (
+    ctx.numericClassifier &&
+    resolved.kind === "primitive" &&
+    isNumericIrType(resolved)
+  ) {
+    const kind = ctx.numericClassifier.getExpressionKind(node);
+    return { kind: "primitive", name: kind };
+  }
+
+  if (
+    sig?.declaration &&
+    ts.isFunctionLike(sig.declaration) &&
+    sig.declaration.type?.kind === ts.SyntaxKind.NumberKeyword &&
+    ctx.numericClassifier
+  ) {
+    const kind = ctx.numericClassifier.getReturnKind(sig.declaration);
+    return { kind: "primitive", name: kind };
+  }
 
   if (resolved.kind !== "unknown") {
     return resolved;
   }
 
-  const sig = ctx.checker.getResolvedSignature(node);
-  if (sig) {
+  if (sig?.declaration && ts.isFunctionLike(sig.declaration)) {
     const retType = ctx.checker.getReturnTypeOfSignature(sig);
-    return resolveType(retType, ctx.checker);
+    if (sig.declaration.type) {
+      return resolveTypeFromNode(
+        sig.declaration.type,
+        ctx.checker,
+        ctx.sourceFile,
+        undefined,
+        undefined,
+      );
+    }
+    const retResolved = resolveType(
+      retType,
+      ctx.checker,
+      undefined,
+      ctx.numericClassifier,
+    );
+    if (ctx.numericClassifier && isNumericIrType(retResolved)) {
+      const kind = ctx.numericClassifier.getReturnKind(sig.declaration);
+      if (kind !== "f64") {
+        return { kind: "primitive", name: kind };
+      }
+    }
+    return retResolved;
   }
 
   return resolved;
@@ -551,9 +772,21 @@ function transformArrowFunction(
   const params: { name: string; type: IRType }[] = [];
   for (const param of node.parameters) {
     const paramName = param.name.getText(ctx.sourceFile);
+    const paramSym = ctx.checker.getSymbolAtLocation(param.name);
     const paramType = param.type
-      ? resolveTypeFromNode(param.type, ctx.checker, ctx.sourceFile)
-      : resolveType(ctx.checker.getTypeAtLocation(param), ctx.checker);
+      ? resolveTypeFromNode(
+          param.type,
+          ctx.checker,
+          ctx.sourceFile,
+          paramSym ?? undefined,
+          ctx.numericClassifier,
+        )
+      : resolveType(
+          ctx.checker.getTypeAtLocation(param),
+          ctx.checker,
+          paramSym ?? undefined,
+          ctx.numericClassifier,
+        );
 
     params.push({ name: paramName, type: paramType });
   }
@@ -561,10 +794,24 @@ function transformArrowFunction(
   const sig = ctx.checker.getSignatureFromDeclaration(node);
   let returnType: IRType = { kind: "unknown" };
   if (sig) {
-    returnType = resolveType(
-      ctx.checker.getReturnTypeOfSignature(sig),
-      ctx.checker,
-    );
+    const retTs = ctx.checker.getReturnTypeOfSignature(sig);
+    if (
+      ctx.numericClassifier &&
+      sig.declaration &&
+      ts.isFunctionLike(sig.declaration) &&
+      (retTs.flags & ts.TypeFlags.Number ||
+        retTs.flags & ts.TypeFlags.NumberLiteral)
+    ) {
+      const kind = ctx.numericClassifier.getReturnKind(sig.declaration);
+      returnType = { kind: "primitive", name: kind };
+    } else {
+      returnType = resolveType(
+        retTs,
+        ctx.checker,
+        undefined,
+        ctx.numericClassifier,
+      );
+    }
   }
 
   const body: IRNode[] = [];
@@ -824,6 +1071,19 @@ function isConsoleLog(node: ts.CallExpression): boolean {
   );
 }
 
+const MATH_RUNTIME_FNS = new Set(["floor", "ceil", "trunc", "round", "abs"]);
+
+function getMathRuntimeFn(node: ts.CallExpression): string | null {
+  if (!ts.isPropertyAccessExpression(node.expression)) return null;
+  const obj = node.expression;
+  if (!ts.isIdentifier(obj.expression) || obj.expression.text !== "Math") {
+    return null;
+  }
+  const method = obj.name.text;
+  if (!MATH_RUNTIME_FNS.has(method)) return null;
+  return method;
+}
+
 function isAssignmentOperator(kind: ts.SyntaxKind): boolean {
   return (
     kind === ts.SyntaxKind.EqualsToken ||
@@ -864,6 +1124,18 @@ function mapBinaryOperator(kind: ts.SyntaxKind): string {
       return "and";
     case ts.SyntaxKind.BarBarToken:
       return "or";
+    case ts.SyntaxKind.BarToken:
+      return "|";
+    case ts.SyntaxKind.AmpersandToken:
+      return "&";
+    case ts.SyntaxKind.CaretToken:
+      return "^";
+    case ts.SyntaxKind.LessThanLessThanToken:
+      return "<<";
+    case ts.SyntaxKind.GreaterThanGreaterThanToken:
+      return ">>";
+    case ts.SyntaxKind.GreaterThanGreaterThanGreaterThanToken:
+      return ">>";
     default:
       return "+";
   }

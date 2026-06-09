@@ -11,6 +11,28 @@ import {
 } from "./expressions";
 import type { IRVariable, IRType } from "../../types";
 
+function resolveBindingType(
+  tsType: ts.Type,
+  declSym: ts.Symbol | undefined,
+  ctx: TransformContext,
+): IRType {
+  const isNumber =
+    !!(tsType.flags & ts.TypeFlags.Number) ||
+    !!(tsType.flags & ts.TypeFlags.NumberLiteral);
+
+  if (ctx.numericClassifier && declSym && isNumber) {
+    const kind = ctx.numericClassifier.getBindingNumericKind(declSym);
+    return { kind: "primitive", name: kind };
+  }
+
+  return resolveType(
+    tsType,
+    ctx.checker,
+    declSym ?? undefined,
+    ctx.numericClassifier,
+  );
+}
+
 export function transformVariable(
   decl: ts.VariableDeclaration,
   stmt: ts.VariableStatement | null,
@@ -18,9 +40,17 @@ export function transformVariable(
 ): IRVariable | null {
   const name = decl.name.getText(ctx.sourceFile);
 
+  const declSym = ctx.checker.getSymbolAtLocation(decl.name);
+
   let type: IRType;
   if (decl.type) {
-    type = resolveTypeFromNode(decl.type, ctx.checker, ctx.sourceFile);
+    type = resolveTypeFromNode(
+      decl.type,
+      ctx.checker,
+      ctx.sourceFile,
+      declSym ?? undefined,
+      ctx.numericClassifier,
+    );
   } else if (decl.initializer && ts.isNewExpression(decl.initializer)) {
     const instantiation = getNewExpressionInstantiation(decl.initializer, ctx);
     if (instantiation.typeArgZig) {
@@ -31,11 +61,11 @@ export function transformVariable(
       };
     } else {
       const tsType = ctx.checker.getTypeAtLocation(decl);
-      type = resolveType(tsType, ctx.checker);
+      type = resolveBindingType(tsType, declSym, ctx);
     }
   } else {
     const tsType = ctx.checker.getTypeAtLocation(decl);
-    type = resolveType(tsType, ctx.checker);
+    type = resolveBindingType(tsType, declSym, ctx);
   }
 
   const tsIsConst = !!(

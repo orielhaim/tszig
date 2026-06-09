@@ -1,7 +1,7 @@
 import * as ts from "typescript";
 import { resolve, join, relative, sep } from "node:path";
 import { readdirSync, statSync } from "node:fs";
-import { analyzeSourceFile } from "../analyzer";
+import { analyzeSourceFile, NumericClassifier } from "../analyzer";
 import { transformToIR } from "../transformer";
 import { generateZig } from "../codegen";
 import type { TypeExportMap } from "../codegen/utils";
@@ -158,6 +158,9 @@ export function compile(
 
   const typeExports = buildTypeExportMap(program, resolvedInputDir);
 
+  const numericClassifier = new NumericClassifier(program, checker);
+  numericClassifier.analyze();
+
   const compiledModules: {
     relativePath: string;
     zigPath: string;
@@ -177,7 +180,12 @@ export function compile(
 
     try {
       const analysis = analyzeSourceFile(sourceFile, checker, diagnostics);
-      const ir = transformToIR(analysis, checker, diagnostics);
+      const ir = transformToIR(
+        analysis,
+        checker,
+        diagnostics,
+        numericClassifier,
+      );
       compiledModules.push({ relativePath, zigPath, ir });
     } catch (err: any) {
       diagnostics.push({

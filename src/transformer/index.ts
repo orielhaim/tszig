@@ -1,5 +1,6 @@
 import * as ts from "typescript";
 import type { AnalysisResult } from "../analyzer";
+import type { NumericClassifier } from "../analyzer/numeric-classifier";
 import { ClassRegistry } from "./class-registry";
 import { blockAllocates } from "../analyzer/allocation";
 import type {
@@ -10,6 +11,7 @@ import type {
   IRFunction,
   IRArrowFunction,
   IRStruct,
+  IRType,
 } from "../types";
 import { transformFunction } from "./passes/functions";
 import { transformClass } from "./passes/classes";
@@ -25,6 +27,7 @@ export function transformToIR(
   analysis: AnalysisResult,
   checker: ts.TypeChecker,
   diagnostics: Diagnostic[],
+  numericClassifier?: NumericClassifier,
 ): IRModule {
   _hoistCounter = 0;
 
@@ -47,6 +50,7 @@ export function transformToIR(
     anonStructs: [],
     anonStructCache: new Map(),
     classRegistry,
+    numericClassifier,
   };
 
   const body: IRNode[] = [];
@@ -271,5 +275,7 @@ export interface TransformContext {
   anonStructs: IRStruct[];
   anonStructCache: Map<string, string>;
   classRegistry: ClassRegistry;
+  numericClassifier?: NumericClassifier;
   currentClass?: string;
+  bindingTypes?: Map<string, IRType>;
 }

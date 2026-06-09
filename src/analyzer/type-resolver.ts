@@ -1,7 +1,35 @@
 import * as ts from "typescript";
 import type { IRType } from "../types";
+import type { NumericClassifier } from "./numeric-classifier";
 
-export function resolveType(type: ts.Type, checker: ts.TypeChecker): IRType {
+function resolveNumberPrimitive(
+  type: ts.Type,
+  checker: ts.TypeChecker,
+  typeSymbol?: ts.Symbol,
+  classifier?: NumericClassifier,
+): IRType {
+  if (classifier && typeSymbol) {
+    const kind = classifier.getNumericKind(typeSymbol);
+    return { kind: "primitive", name: kind };
+  }
+
+  if (type.flags & ts.TypeFlags.NumberLiteral && classifier) {
+    const value = (type as ts.NumberLiteralType).value;
+    if (Number.isInteger(value)) {
+      return { kind: "primitive", name: "i64" };
+    }
+    return { kind: "primitive", name: "f64" };
+  }
+
+  return { kind: "primitive", name: "f64" };
+}
+
+export function resolveType(
+  type: ts.Type,
+  checker: ts.TypeChecker,
+  typeSymbol?: ts.Symbol,
+  classifier?: NumericClassifier,
+): IRType {
   if (type.flags & ts.TypeFlags.Null || type.flags & ts.TypeFlags.Undefined) {
     return { kind: "optional", inner: { kind: "primitive", name: "void" } };
   }
@@ -21,7 +49,7 @@ export function resolveType(type: ts.Type, checker: ts.TypeChecker): IRType {
     type.flags & ts.TypeFlags.Number ||
     type.flags & ts.TypeFlags.NumberLiteral
   ) {
-    return { kind: "primitive", name: "f64" };
+    return resolveNumberPrimitive(type, checker, typeSymbol, classifier);
   }
 
   if (
@@ -44,7 +72,12 @@ export function resolveType(type: ts.Type, checker: ts.TypeChecker): IRType {
     );
 
     if (hasNull && nonNullTypes.length === 1) {
-      const inner = resolveType(nonNullTypes[0], checker);
+      const inner = resolveType(
+        nonNullTypes[0],
+        checker,
+        undefined,
+        classifier,
+      );
       return { kind: "optional", inner };
     }
 
@@ -60,14 +93,21 @@ export function resolveType(type: ts.Type, checker: ts.TypeChecker): IRType {
 
   if (checker.isTupleType(type)) {
     const elements =
-      type.typeArguments?.map((t) => resolveType(t, checker)) ?? [];
+      type.typeArguments?.map((t) =>
+        resolveType(t, checker, undefined, classifier),
+      ) ?? [];
     return { kind: "tuple", elements };
   }
 
   if (checker.isArrayType(type)) {
     const typeArgs = (type as ts.TypeReference).typeArguments;
     if (typeArgs && typeArgs.length > 0) {
-      const elementType = resolveType(typeArgs[0], checker);
+      const elementType = resolveType(
+        typeArgs[0],
+        checker,
+        undefined,
+        classifier,
+      );
       return { kind: "array", elementType };
     }
     return { kind: "array", elementType: { kind: "unknown" } };
@@ -79,11 +119,23 @@ export function resolveType(type: ts.Type, checker: ts.TypeChecker): IRType {
       const sig = callSignatures[0];
       const params = sig.parameters.map((p) => {
         const paramType = checker.getTypeOfSymbol(p);
-        return resolveType(paramType, checker);
+        const paramSym = p.valueDeclaration
+          ? checker.getSymbolAtLocation(
+              (p.valueDeclaration as ts.ParameterDeclaration).name,
+            )
+          : undefined;
+        return resolveType(
+          paramType,
+          checker,
+          paramSym ?? undefined,
+          classifier,
+        );
       });
       const returnType = resolveType(
         checker.getReturnTypeOfSignature(sig),
         checker,
+        undefined,
+        classifier,
       );
       return { kind: "function", params, returnType };
     }
@@ -143,10 +195,11 @@ export function resolveType(type: ts.Type, checker: ts.TypeChecker): IRType {
 export function resolveContextualType(
   node: ts.Expression,
   checker: ts.TypeChecker,
+  classifier?: NumericClassifier,
 ): IRType | null {
   const contextualType = checker.getContextualType(node);
   if (!contextualType) return null;
-  return resolveType(contextualType, checker);
+  return resolveType(contextualType, checker, undefined, classifier);
 }
 
 export function resolveNamedTypeForExpression(
@@ -192,13 +245,14 @@ function extractTypeName(type: ts.Type): string | null {
 export function resolveArrayElementTypeFromContext(
   node: ts.ArrayLiteralExpression,
   checker: ts.TypeChecker,
+  classifier?: NumericClassifier,
 ): IRType | null {
   // Try contextual type first
   const contextualType = checker.getContextualType(node);
   if (contextualType && (checker as any).isArrayType(contextualType)) {
     const typeArgs = (contextualType as ts.TypeReference).typeArguments;
     if (typeArgs && typeArgs.length > 0) {
-      return resolveType(typeArgs[0], checker);
+      return resolveType(typeArgs[0], checker, undefined, classifier);
     }
   }
 
@@ -207,7 +261,7 @@ export function resolveArrayElementTypeFromContext(
   if ((checker as any).isArrayType(type)) {
     const typeArgs = (type as ts.TypeReference).typeArguments;
     if (typeArgs && typeArgs.length > 0) {
-      return resolveType(typeArgs[0], checker);
+      return resolveType(typeArgs[0], checker, undefined, classifier);
     }
   }
 
@@ -218,6 +272,8 @@ export function resolveTypeFromNode(
   node: ts.TypeNode | undefined,
   checker: ts.TypeChecker,
   sourceFile: ts.SourceFile,
+  typeSymbol?: ts.Symbol,
+  classifier?: NumericClassifier,
 ): IRType {
   if (!node) return { kind: "unknown" };
 
@@ -230,6 +286,8 @@ export function resolveTypeFromNode(
         node.typeArguments[0],
         checker,
         sourceFile,
+        undefined,
+        classifier,
       );
       return { kind: "array", elementType };
     }
@@ -241,7 +299,7 @@ export function resolveTypeFromNode(
     return {
       kind: "tuple",
       elements: node.elements.map((e) =>
-        resolveTypeFromNode(e, checker, sourceFile),
+        resolveTypeFromNode(e, checker, sourceFile, undefined, classifier),
       ),
     };
   }
@@ -251,6 +309,8 @@ export function resolveTypeFromNode(
       node.elementType,
       checker,
       sourceFile,
+      undefined,
+      classifier,
     );
     return { kind: "array", elementType };
   }
@@ -272,7 +332,13 @@ export function resolveTypeFromNode(
     );
 
     if (hasNull && nonNullTypes.length === 1) {
-      const inner = resolveTypeFromNode(nonNullTypes[0], checker, sourceFile);
+      const inner = resolveTypeFromNode(
+        nonNullTypes[0],
+        checker,
+        sourceFile,
+        undefined,
+        classifier,
+      );
       return { kind: "optional", inner };
     }
 
@@ -281,15 +347,27 @@ export function resolveTypeFromNode(
 
   if (ts.isFunctionTypeNode(node)) {
     const params = node.parameters.map((p) =>
-      resolveTypeFromNode(p.type, checker, sourceFile),
+      resolveTypeFromNode(p.type, checker, sourceFile, undefined, classifier),
     );
-    const returnType = resolveTypeFromNode(node.type, checker, sourceFile);
+    const returnType = resolveTypeFromNode(
+      node.type,
+      checker,
+      sourceFile,
+      undefined,
+      classifier,
+    );
     return { kind: "function", params, returnType };
   }
 
   const keyword = node.kind;
   switch (keyword) {
     case ts.SyntaxKind.NumberKeyword:
+      if (classifier && typeSymbol) {
+        return {
+          kind: "primitive",
+          name: classifier.getBindingNumericKind(typeSymbol),
+        };
+      }
       return { kind: "primitive", name: "f64" };
     case ts.SyntaxKind.StringKeyword:
       return { kind: "string" };

@@ -76,6 +76,16 @@ export function generateRuntime(): string {
   pub fn abs(value: f64) f64 {
       return @abs(value);
   }
+
+  /// Math.trunc
+  pub fn trunc(value: f64) f64 {
+      return @trunc(value);
+  }
+
+  /// Math.round
+  pub fn round(value: f64) f64 {
+      return @round(value);
+  }
   
   /// Extract the return type from a function or function pointer type.
   pub fn ReturnType(comptime func: anytype) type {

@@ -1,6 +1,9 @@
 import * as ts from "typescript";
 import type { Diagnostic } from "../types";
 
+export { NumericClassifier } from "./numeric-classifier";
+export type { InferredNumericKind } from "./numeric-classifier";
+
 export type ModuleKind = "library" | "executable" | "script";
 
 export interface AnalysisResult {

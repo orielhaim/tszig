@@ -330,6 +330,76 @@ export function typesEqual(
   }
 }
 
+export function isComptimeNumericExpr(expr: string): boolean {
+  const s = expr.trim();
+  if (/^-?\d+$/.test(s)) return true;
+  if (/^-?\d+\.\d+$/.test(s)) return true;
+  if (/^@as\((i64|usize|f64|u8),\s*-?\d+(\.\d+)?\)$/.test(s)) return true;
+  if (/^-@as\((i64|usize),\s*\d+\)$/.test(s)) return true;
+  return false;
+}
+
+function formatFloatLiteral(n: number): string {
+  if (Number.isInteger(n)) {
+    return n < 0 ? `-${Math.abs(n)}.0` : `${n}.0`;
+  }
+  return `${n}`;
+}
+
+function extractComptimeInt(expr: string): number | null {
+  const s = expr.trim();
+  let m = /^(-?\d+)$/.exec(s);
+  if (m) return Number.parseInt(m[1], 10);
+  m = /^@as\((i64|usize|u8),\s*(-?\d+)\)$/.exec(s);
+  if (m) return Number.parseInt(m[2], 10);
+  m = /^-@as\((i64|usize),\s*(\d+)\)$/.exec(s);
+  if (m) return -Number.parseInt(m[2], 10);
+  return null;
+}
+
+function trySimplifyNumericCoercion(
+  expr: string,
+  from: IRType | undefined,
+  to: IRType | undefined,
+): string | null {
+  if (!from || !to) return null;
+  if (from.kind === "unknown" || to.kind === "unknown") return null;
+  if (typesEqual(from, to)) return expr;
+
+  const fc = numericCategory(from);
+  const tc = numericCategory(to);
+  if (fc === "none" || tc === "none") return null;
+
+  const comptime = isComptimeNumericExpr(expr);
+
+  if (tc === "float" && (fc === "signedInt" || fc === "unsignedInt")) {
+    const n = extractComptimeInt(expr);
+    if (n !== null && comptime) return formatFloatLiteral(n);
+  }
+
+  if (
+    (fc === "signedInt" || fc === "unsignedInt") &&
+    (tc === "signedInt" || tc === "unsignedInt") &&
+    comptime
+  ) {
+    const n = extractComptimeInt(expr);
+    if (n !== null) return `${n}`;
+  }
+
+  if (
+    fc === "float" &&
+    (tc === "signedInt" || tc === "unsignedInt") &&
+    comptime
+  ) {
+    const m = /^(-?\d+\.\d+)$/.exec(expr.trim());
+    if (m) return m[1];
+    const m2 = /^@as\(f64,\s*(-?\d+(\.\d+)?)\)$/.exec(expr.trim());
+    if (m2) return m2[1];
+  }
+
+  return null;
+}
+
 export function coerce(
   expr: string,
   from: IRType | undefined,
@@ -357,24 +427,28 @@ export function coerce(
     return coerce(expr, from.okType, to);
   }
 
+  const simplified = trySimplifyNumericCoercion(expr, from, to);
+  if (simplified !== null) return simplified;
+
   const fc = numericCategory(from);
   const tc = numericCategory(to);
+  const comptime = isComptimeNumericExpr(expr);
 
-  // Numeric → numeric
   if (fc !== "none" && tc !== "none" && fc !== tc) {
-    // int → float
     if (tc === "float" && (fc === "signedInt" || fc === "unsignedInt")) {
       return `@as(${(to as any).name}, @floatFromInt(${expr}))`;
     }
-    // float → int
     if (fc === "float" && (tc === "signedInt" || tc === "unsignedInt")) {
       return `@as(${(to as any).name}, @intFromFloat(${expr}))`;
     }
-    // int ↔ int (different signedness/width)
     if (
       (fc === "signedInt" || fc === "unsignedInt") &&
       (tc === "signedInt" || tc === "unsignedInt")
     ) {
+      if (comptime) {
+        const n = extractComptimeInt(expr);
+        if (n !== null) return `${n}`;
+      }
       return `@as(${(to as any).name}, @intCast(${expr}))`;
     }
   }
@@ -384,6 +458,10 @@ export function coerce(
     tc !== "none" &&
     (from as any).name !== (to as any).name
   ) {
+    if (comptime) {
+      const simplifiedSame = trySimplifyNumericCoercion(expr, from, to);
+      if (simplifiedSame !== null) return simplifiedSame;
+    }
     return `@as(${(to as any).name}, ${expr})`;
   }
 
@@ -460,7 +538,13 @@ export function getNodeType(node: IRNode): IRType {
     return { kind: "unknown" };
   }
 
-  if (node.kind === "nullishCoalesce") return getNodeType((node as any).right);
+  if (node.kind === "nullishCoalesce") {
+    const rt = (node as any).resultType as IRType | undefined;
+    if (rt) return rt;
+    const left = getNodeType((node as any).left);
+    const right = getNodeType((node as any).right);
+    return commonNumericType(left, right) ?? right;
+  }
 
   if (node.kind === "binary") {
     const rt = (node as any).resultType as IRType | undefined;
@@ -473,6 +557,17 @@ export function getNodeType(node: IRNode): IRType {
       (r.kind === "primitive" && r.name === "f64")
     ) {
       return { kind: "primitive", name: "f64" };
+    }
+    if (
+      l.kind === "primitive" &&
+      r.kind === "primitive" &&
+      (l.name === "i64" || l.name === "usize") &&
+      (r.name === "i64" || r.name === "usize")
+    ) {
+      if (l.name === "usize" || r.name === "usize") {
+        return { kind: "primitive", name: "usize" };
+      }
+      return { kind: "primitive", name: "i64" };
     }
     return l.kind !== "unknown" ? l : r;
   }
@@ -541,6 +636,47 @@ export function formatSpecForType(type: IRType): string {
 
 export function isArithmeticOp(op: string): boolean {
   return op === "+" || op === "-" || op === "*" || op === "/" || op === "%";
+}
+
+const BINARY_PRECEDENCE: Record<string, number> = {
+  "||": 3,
+  "&&": 4,
+  "|": 5,
+  "^": 6,
+  "&": 7,
+  "==": 8,
+  "!=": 8,
+  "<": 9,
+  "<=": 9,
+  ">": 9,
+  ">=": 9,
+  "<<": 10,
+  ">>": 10,
+  "+": 11,
+  "-": 11,
+  "*": 12,
+  "/": 12,
+  "%": 12,
+};
+
+export function binaryOpPrecedence(op: string): number | undefined {
+  return BINARY_PRECEDENCE[op];
+}
+
+export function wrapBinaryChild(
+  child: IRNode,
+  expr: string,
+  parentOp: string,
+  isRight: boolean,
+): string {
+  if (child.kind !== "binary") return expr;
+  const childOp = (child as { operator: string }).operator;
+  const parentPrec = binaryOpPrecedence(parentOp);
+  const childPrec = binaryOpPrecedence(childOp);
+  if (parentPrec === undefined || childPrec === undefined) return expr;
+  if (childPrec < parentPrec) return `(${expr})`;
+  if (childPrec === parentPrec && isRight) return `(${expr})`;
+  return expr;
 }
 
 export function isFloatTyped(node: IRNode): boolean {
@@ -835,4 +971,41 @@ export function isIntegerTyped(node: IRNode): boolean {
     t.kind === "primitive" &&
     (t.name === "i64" || t.name === "usize" || t.name === "u8")
   );
+}
+
+export function isSignedIntegerType(type: IRType): boolean {
+  return type.kind === "primitive" && type.name === "i64";
+}
+
+export function isSignedIntegerTyped(node: IRNode): boolean {
+  return isSignedIntegerType(getNodeType(node));
+}
+
+export function commonNumericType(
+  a: IRType | undefined,
+  b: IRType | undefined,
+): IRType | null {
+  const unwrap = (t: IRType | undefined): IRType | undefined => {
+    if (!t) return undefined;
+    if (t.kind === "optional") return unwrap(t.inner);
+    return t;
+  };
+  const left = unwrap(a);
+  const right = unwrap(b);
+  if (!left || !right) return null;
+  const la = numericCategory(left);
+  const rb = numericCategory(right);
+  if (la === "none" || rb === "none") return null;
+  if (la === "float" || rb === "float") {
+    return { kind: "primitive", name: "f64" };
+  }
+  if (la === "unsignedInt" || rb === "unsignedInt") {
+    if (left.kind === "primitive" && left.name === "usize") {
+      return left;
+    }
+    if (right.kind === "primitive" && right.name === "usize") {
+      return right;
+    }
+  }
+  return { kind: "primitive", name: "i64" };
 }

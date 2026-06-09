@@ -20,6 +20,7 @@ import { Particle, ParticleSystem } from "./class_composition";
 import { isPrime, gcd, factorial, collatzSteps } from "./complex_algorithms";
 import { totalArea, createShapeGallery } from "./polymorphism";
 import { NumberCollection, StringCollection } from "./generic_inheritance";
+import { runNumericInferenceTests } from "./numeric_inference";
 
 function main(): void {
   // Primitives
@@ -138,6 +139,11 @@ function main(): void {
   sc.add("world");
   console.log(sc.describe());
   console.log("Joined:", sc.joinAll(", "));
+
+  const niResults = runNumericInferenceTests();
+  for (const r of niResults) {
+    console.log("NI:", r);
+  }
 }
 
 main();

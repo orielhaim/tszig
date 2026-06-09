@@ -942,8 +942,13 @@ function generateReturn(
 ): void {
   if (node.value) {
     const raw = generateExpr(node.value, diagnostics);
+    const valueIrType =
+      node.value.kind === "nullishCoalesce" &&
+      (node.value as { resultType?: IRType }).resultType
+        ? (node.value as { resultType: IRType }).resultType
+        : getNodeType(node.value);
     const valueStr = functionReturnType
-      ? coerce(raw, getNodeType(node.value), functionReturnType)
+      ? coerce(raw, valueIrType, functionReturnType)
       : raw;
     w.writeLine(`return ${valueStr};`);
   } else {
@@ -1481,6 +1486,14 @@ function needsResultDiscard(node: any): boolean {
   if (!node) return false;
 
   if (node.kind !== "call") return false;
+
+  if (
+    node.callee?.kind === "member" &&
+    node.callee.property === "append" &&
+    node.callee.objectType?.kind === "array"
+  ) {
+    return false;
+  }
 
   const resultType = node.resultType as IRType | undefined;
   if (!resultType) return false;

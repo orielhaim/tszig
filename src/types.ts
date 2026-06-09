@@ -254,6 +254,7 @@ export interface IRArrayLiteral {
   elements: IRNode[];
   elementType: IRType;
   isTuple?: boolean;
+  tupleElementTypes?: IRType[];
 }
 
 export interface IRObjectLiteral {
@@ -309,6 +310,7 @@ export interface IRNullishCoalesce {
   kind: "nullishCoalesce";
   left: IRNode;
   right: IRNode;
+  resultType?: IRType;
 }
 
 export interface IRTypeAlias {

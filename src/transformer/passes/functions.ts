@@ -1,10 +1,15 @@
 import * as ts from "typescript";
 import type { TransformContext } from "../index";
 import { blockAllocates } from "../../analyzer/allocation";
-import { resolveType, resolveTypeFromNode } from "../../analyzer/type-resolver";
 import { transformStatement } from "./statements";
 import { transformExpression } from "./expressions";
 import type { IRFunction, IRParam, IRType, IRNode } from "../../types";
+import {
+  paramBindingsFromParams,
+  resolveParamType,
+  resolveReturnType,
+  withBindingTypes,
+} from "../bindings";
 
 export function transformFunction(
   node: ts.FunctionDeclaration,
@@ -23,16 +28,7 @@ export function transformFunction(
   const params: IRParam[] = [];
   for (const param of node.parameters) {
     const paramName = param.name.getText(ctx.sourceFile);
-    let paramType: IRType;
-
-    if (param.type) {
-      paramType = resolveTypeFromNode(param.type, ctx.checker, ctx.sourceFile);
-    } else {
-      paramType = resolveType(
-        ctx.checker.getTypeAtLocation(param),
-        ctx.checker,
-      );
-    }
+    let paramType = resolveParamType(param, ctx);
 
     if (isGeneric) {
       paramType = replaceGenericTypes(paramType, typeParamNames);
@@ -53,18 +49,7 @@ export function transformFunction(
     });
   }
 
-  let returnType: IRType;
-  if (node.type) {
-    returnType = resolveTypeFromNode(node.type, ctx.checker, ctx.sourceFile);
-  } else {
-    const sig = ctx.checker.getSignatureFromDeclaration(node);
-    if (sig) {
-      const tsRetType = ctx.checker.getReturnTypeOfSignature(sig);
-      returnType = resolveType(tsRetType, ctx.checker);
-    } else {
-      returnType = { kind: "primitive", name: "void" };
-    }
-  }
+  let returnType = resolveReturnType(node, ctx);
 
   if (isGeneric) {
     returnType = replaceGenericTypes(returnType, typeParamNames);
@@ -90,10 +75,12 @@ export function transformFunction(
 
   const body: IRNode[] = [];
   if (node.body) {
-    for (const stmt of node.body.statements) {
-      const result = transformStatement(stmt, ctx);
-      if (result) body.push(result);
-    }
+    withBindingTypes(ctx, paramBindingsFromParams(params), () => {
+      for (const stmt of node.body!.statements) {
+        const result = transformStatement(stmt, ctx);
+        if (result) body.push(result);
+      }
+    });
   }
 
   if (isGeneric) {

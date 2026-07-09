@@ -1,5 +1,8 @@
 # TSZIG
 
+[![Status](https://img.shields.io/badge/status-in%20development-orange?style=flat-square)](https://github.com/orielhaim/TunTun)
+[![Discord](https://img.shields.io/badge/discord-join%20server-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.gg/y5bNc3MYKz)
+
 TSZIG is an experimental compiler project that aims to transform TypeScript code into readable Zig code. The goal is to explore what a TypeScript-to-Zig workflow could look like while keeping the generated output simple and understandable.
 
 ## Why?
